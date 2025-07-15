@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+.env
+.DS_Store
+dist/
+build/
+*.log
+
+# Prisma-specific
+/prisma/migrations/
+
+/src/generated/prisma
+.env*

@@ -1,0 +1,134 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique @db.VarChar(50)
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  phone        String   @db.VarChar(20)
+  role         Role     @default(TRADER)
+  isActive     Boolean  @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  orders Order[]
+  tradesAsBuyer Trade[] @relation("BuyerTrades")
+  tradesAsSeller Trade[] @relation("SellerTrades")
+  pendingTradesAsBuyer PendingTrade[] @relation("BuyerPendingTrades")
+  pendingTradesAsSeller PendingTrade[] @relation("SellerPendingTrades")
+
+  @@map("users")
+}
+
+model Order {
+  id          String   @id @default(uuid())
+  action      OrderAction
+  price       Decimal  @db.Decimal(10, 2)
+  asset       String   @db.VarChar(100)
+  amount      Int
+  remaining   Int
+  matched     Boolean  @default(false)
+  counterparty String? @db.VarChar(50)
+  status      OrderStatus @default(ACTIVE)
+  expiresAt   DateTime? @map("expires_at")
+  metadata    Json?
+  userId      String   @map("user_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user User @relation(fields: [userId], references: [id])
+  buyerTrades Trade[] @relation("BuyerOrders")
+  sellerTrades Trade[] @relation("SellerOrders")
+  pendingTradesAsBid PendingTrade[] @relation("BidPendingTrades")
+  pendingTradesAsOffer PendingTrade[] @relation("OfferPendingTrades")
+
+  @@map("orders")
+}
+
+model Trade {
+  id            String   @id @default(uuid())
+  asset         String   @db.VarChar(100)
+  price         Decimal  @db.Decimal(10, 2)
+  amount        Int
+  buyerOrderId  String   @map("buyer_order_id")
+  sellerOrderId String   @map("seller_order_id")
+  commission    Decimal? @db.Decimal(10, 2)
+  buyerId       String   @map("buyer_id")
+  sellerId      String   @map("seller_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  // Relations
+  buyerOrder  Order @relation("BuyerOrders", fields: [buyerOrderId], references: [id])
+  sellerOrder Order @relation("SellerOrders", fields: [sellerOrderId], references: [id])
+  buyer       User  @relation("BuyerTrades", fields: [buyerId], references: [id])
+  seller      User  @relation("SellerTrades", fields: [sellerId], references: [id])
+
+  @@map("trades")
+}
+
+model PendingTrade {
+  id        String   @id @default(cuid())
+  bidId     String
+  offerId   String
+  bid       Order    @relation("BidPendingTrades", fields: [bidId], references: [id])
+  offer     Order    @relation("OfferPendingTrades", fields: [offerId], references: [id])
+  
+  asset     String
+  price     Float
+  amount    Int
+  product   String
+  monthyear String
+  
+  buyerId   String
+  buyer     User     @relation("BuyerPendingTrades", fields: [buyerId], references: [id])
+  sellerId  String
+  seller    User     @relation("SellerPendingTrades", fields: [sellerId], references: [id])
+  
+  status    PendingTradeStatus @default(PENDING)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId, status])
+  @@index([expiresAt])
+}
+
+enum Role {
+  TRADER
+  ADMIN
+}
+
+enum OrderAction {
+  BID
+  OFFER
+}
+
+enum OrderStatus {
+  ACTIVE
+  MATCHED
+  CANCELLED
+  EXPIRED
+}
+
+enum PendingTradeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  TIMEOUT
+}
