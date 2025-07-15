@@ -6,6 +6,7 @@ import { authMiddleware, AuthenticatedRequest } from '../middleware/auth';
 import { validateOrderInput } from '../utils';
 import { WebSocketService } from '../services/websocket';
 import { wsService } from '../ws-singleton'; // This file will export the shared wsService instance
+import { whatsappAuthService } from '../services/whatsapp-auth';
 
 const router = express.Router();
 const authService = new AuthService();
@@ -24,24 +25,106 @@ router.post('/auth/register', async (req, res) => {
     // Normalize role to uppercase for Prisma enum
     const normalizedRole = role ? role.toUpperCase() as 'TRADER' | 'ADMIN' : 'TRADER';
 
-    const result = await authService.register({ username, email, password, phone, role: normalizedRole });
+    // Check for existing WhatsApp activity with this phone number
+    console.log('[Registration] Checking for existing WhatsApp activity...');
+    const whatsappActivity = await whatsappAuthService.hasWhatsAppActivity(phone);
     
-    if (result.success) {
-      res.status(201).json({
-        message: 'User registered successfully',
-        user: {
-          id: result.user?.id,
-          username: result.user?.username,
-          email: result.user?.email,
-          role: result.user?.role
-        },
-        token: result.token
+    if (whatsappActivity.hasActivity && whatsappActivity.isGuest) {
+      // User has WhatsApp guest activity - link/upgrade the account
+      console.log('[Registration] Found WhatsApp guest activity, attempting to link...');
+      const linkResult = await whatsappAuthService.linkWebRegistration(phone, username, email, password);
+      
+      if (linkResult.success) {
+        // Successfully upgraded WhatsApp guest to registered user
+        // Get the updated user and generate a new token
+        const updatedUser = await authService.login({ username, password });
+        
+        if (updatedUser.success) {
+          return res.status(201).json({
+            message: `Registration successful! ${linkResult.message}`,
+            whatsappActivity: {
+              linked: true,
+              preservedOrders: whatsappActivity.orderCount,
+              preservedTrades: whatsappActivity.tradeCount
+            },
+            user: {
+              id: updatedUser.user?.id,
+              username: updatedUser.user?.username,
+              email: updatedUser.user?.email,
+              role: updatedUser.user?.role
+            },
+            token: updatedUser.token
+          });
+        } else {
+          return res.status(500).json({ error: 'Account created but login failed. Please try logging in manually.' });
+        }
+      } else {
+        return res.status(400).json({ error: linkResult.message });
+      }
+    } else if (whatsappActivity.hasActivity && !whatsappActivity.isGuest) {
+      // Phone belongs to already registered user
+      return res.status(400).json({ 
+        error: 'This phone number is already registered with an existing account. Please use a different phone number or login with your existing credentials.' 
       });
     } else {
-      res.status(400).json({ error: result.error });
+      // No WhatsApp activity or just a guest with no activity - proceed with normal registration
+      console.log('[Registration] No WhatsApp activity found, creating new user...');
+      const result = await authService.register({ username, email, password, phone, role: normalizedRole });
+      
+      if (result.success) {
+        res.status(201).json({
+          message: 'User registered successfully',
+          whatsappActivity: {
+            linked: false,
+            preservedOrders: 0,
+            preservedTrades: 0
+          },
+          user: {
+            id: result.user?.id,
+            username: result.user?.username,
+            email: result.user?.email,
+            role: result.user?.role
+          },
+          token: result.token
+        });
+      } else {
+        res.status(400).json({ error: result.error });
+      }
     }
   } catch (error) {
     console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Check WhatsApp activity for phone number (useful for registration flow)
+router.post('/auth/check-whatsapp-activity', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number required' });
+    }
+
+    const activity = await whatsappAuthService.hasWhatsAppActivity(phone);
+    
+    res.json({
+      hasActivity: activity.hasActivity,
+      isGuest: activity.isGuest,
+      summary: activity.hasActivity ? {
+        orderCount: activity.orderCount,
+        tradeCount: activity.tradeCount,
+        message: activity.isGuest 
+          ? `Found ${activity.orderCount} orders and ${activity.tradeCount} trades from WhatsApp. These will be preserved when you register.`
+          : 'This phone number is already registered with an existing account.'
+      } : {
+        orderCount: 0,
+        tradeCount: 0,
+        message: 'No existing activity found.'
+      }
+    });
+  } catch (error) {
+    console.error('Check WhatsApp activity error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

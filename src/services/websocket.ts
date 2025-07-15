@@ -17,9 +17,29 @@ export class WebSocketService {
   private matchingEngine: any = null; // Will be set by the server
 
   constructor(server: HTTPServer) {
+    const allowedOrigins = [
+      process.env.FRONTEND_URL || "http://localhost:3000",
+      "https://giftcard.88808880.xyz",
+      "https://api.giftcard.88808880.xyz", 
+      "https://webhook.88808880.xyz",
+      "http://localhost:3000",
+      "http://localhost:3001"
+    ];
+
     this.io = new SocketIOServer(server, {
       cors: {
-        origin: process.env.FRONTEND_URL || "http://localhost:3000",
+        origin: (origin, callback) => {
+          // Allow requests with no origin (like mobile apps or curl requests)
+          if (!origin) return callback(null, true);
+          
+          if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+          } else {
+            console.warn(`WebSocket CORS blocked request from: ${origin}`);
+            console.log(`Allowed origins: ${allowedOrigins.join(', ')}`);
+            callback(new Error('Not allowed by CORS'));
+          }
+        },
         methods: ["GET", "POST"],
         credentials: true
       },
@@ -40,13 +60,29 @@ export class WebSocketService {
     // Authentication middleware
     this.io.use(async (socket, next) => {
       try {
+        console.log('[WebSocket AUTH] New connection attempt from:', socket.handshake.address);
+        console.log('[WebSocket AUTH] Headers:', {
+          origin: socket.handshake.headers.origin,
+          userAgent: socket.handshake.headers['user-agent']
+        });
+        
         const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
+        console.log('[WebSocket AUTH] Token received:', token ? `${token.slice(0, 20)}...` : 'NO TOKEN');
         
         if (!token) {
+          console.error('[WebSocket AUTH] Authentication failed: No token provided');
           return next(new Error('Authentication error: No token provided'));
         }
 
+        console.log('[WebSocket AUTH] Verifying JWT token...');
         const decoded = jwt.verify(token, SECRET_KEY) as any;
+        console.log('[WebSocket AUTH] JWT decoded successfully:', {
+          userId: decoded.userId,
+          username: decoded.username,
+          role: decoded.role,
+          exp: new Date(decoded.exp * 1000).toISOString()
+        });
+        
         const user: SocketUser = {
           userId: decoded.userId,
           username: decoded.username,
@@ -57,6 +93,7 @@ export class WebSocketService {
         socket.data.user = user;
         this.connectedUsers.set(user.userId, user);
         
+        console.log('[WebSocket AUTH] Storing user session in Redis...');
         // Store user session in Redis
         await redisUtils.setUserSession(user.userId, {
           socketId: socket.id,
@@ -65,9 +102,15 @@ export class WebSocketService {
           role: user.role
         });
 
+        console.log('[WebSocket AUTH] Authentication successful for user:', user.username);
         next();
       } catch (error) {
-        console.error('Socket authentication error:', error);
+        console.error('[WebSocket AUTH] Authentication error:', error);
+        console.error('[WebSocket AUTH] Error details:', {
+          message: (error as Error).message,
+          name: (error as Error).name,
+          stack: (error as Error).stack?.split('\n')[0]
+        });
         next(new Error('Authentication error: Invalid token'));
       }
     });

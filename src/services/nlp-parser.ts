@@ -3,6 +3,7 @@ import { orderBookService } from './order-book';
 import { prisma } from '../database/prisma-client';
 import { WebSocketService } from './websocket';
 import { wsService } from '../ws-singleton';
+import { whatsappAuthService } from './whatsapp-auth';
 import axios from 'axios';
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -74,8 +75,8 @@ export class NLPParser {
           // Validation helpers
           const isValidMonthYear = (str: string) => /^[A-Za-z]{3}\d{2}$/.test(str);
           const isValidProduct = (product: string) => ['wheat', 'gold', 'oil', 'silver'].includes((product || '').toLowerCase());
-          const amount = Number(json.amount);
-          const price = Number(json.price);
+          const amount = parseInt(json.amount?.replace(/,/g, '') || '0');
+          const price = parseFloat(json.price?.replace(/,/g, '') || '0');
           const validAction = ['bid', 'offer'].includes(action);
           const validProduct = isValidProduct(json.product);
           const validMonthYear = isValidMonthYear(json.monthyear);
@@ -117,23 +118,47 @@ export class NLPParser {
 
 /**
  * Process NLP command from WhatsApp
+ * Uses phone-based authentication instead of JWT tokens
  */
 export async function processNLPCommand(message: string, from: string): Promise<{ success: boolean; response: string; error?: string }> {
   try {
     const cleanMessage = message.trim().toLowerCase();
+    const phoneNumber = from.replace('whatsapp:', '');
+    
+    console.log('[NLP] Processing command from:', phoneNumber, '- Message:', message);
+    
+    // Authenticate WhatsApp user (find or create guest user)
+    let session;
+    try {
+      session = await whatsappAuthService.authenticateUser(phoneNumber);
+      console.log('[NLP] WhatsApp user authenticated:', session.username);
+    } catch (error) {
+      console.error('[NLP] WhatsApp authentication failed:', error);
+      return {
+        success: false,
+        response: '',
+        error: 'Authentication failed. Please try again later.'
+      };
+    }
     
     // Handle help command
     if (cleanMessage.includes('help') || cleanMessage.includes('commands')) {
+      const helpText = session.isRegistered ? 
+        `📋 Available Commands for ${session.username}:` :
+        `📋 Available Commands (Guest User):`;
+        
       return {
         success: true,
-        response: `📋 Available Commands:
+        response: `${helpText}
 • "Buy 100 Dec25 Wheat at 150" - Place buy order
 • "Sell 50 Jan26 Gold for 2000" - Place sell order
 • "Market" - View market data
 • "Orders" - View your orders
 • "Trades" - View recent trades
 • "Cancel [order_id]" - Cancel order
-• "Help" - Show this message`
+• "Help" - Show this message
+
+${!session.isRegistered ? '\n💡 You are using a guest account. Register at our website for full features!' : ''}`
       };
     }
 
@@ -159,20 +184,7 @@ export async function processNLPCommand(message: string, from: string): Promise<
 
     // Handle orders request
     if (cleanMessage.includes('orders') || cleanMessage.includes('my orders')) {
-      // Find user by phone number
-      const user = await prisma.user.findFirst({
-        where: { phone: from.replace('whatsapp:', '') }
-      });
-
-      if (!user) {
-        return {
-          success: false,
-          response: '',
-          error: 'User not found. Please register first.'
-        };
-      }
-
-      const orders = await orderBookService.getUserOrders(user.id);
+      const orders = await orderBookService.getUserOrders(session.userId);
       if (orders.length === 0) {
         return {
           success: true,
@@ -181,7 +193,7 @@ export async function processNLPCommand(message: string, from: string): Promise<
       }
 
       const ordersText = orders.slice(0, 5).map(order => 
-        `${order.id}: ${order.action} ${order.amount} ${order.asset} @ ${order.price} (${order.status})`
+        `${order.id.slice(0, 8)}: ${order.action} ${order.amount} ${order.asset} @ ${order.price} (${order.status})`
       ).join('\n');
 
       return {
@@ -222,42 +234,45 @@ export async function processNLPCommand(message: string, from: string): Promise<
       }
 
       const orderId = orderIdMatch[1];
-      const user = await prisma.user.findFirst({
-        where: { phone: from.replace('whatsapp:', '') }
-      });
-
-      if (!user) {
-        return {
-          success: false,
-          response: '',
-          error: 'User not found.'
-        };
-      }
-
-      const result = await orderBookService.cancelOrder(user.id, orderId);
+      const result = await orderBookService.cancelOrder(session.userId, orderId);
       return {
         success: result.success,
         response: result.message
       };
     }
 
-    // Handle order placement
+    // Handle account/balance request
+    if (cleanMessage.includes('account') || cleanMessage.includes('balance') || cleanMessage.includes('summary')) {
+      const summary = await orderBookService.getAccountSummary(session.userId);
+      return {
+        success: true,
+        response: `📈 Account Summary for ${session.username}:
+Total Orders: ${summary.total_orders}
+Active Orders: ${summary.active_orders}
+Total Trades: ${summary.total_trades}
+Total Volume: ${summary.total_volume}
+
+${!session.isRegistered ? '💡 Guest account - Register for full features!' : ''}`
+      };
+    }
+
+    // Check if user can trade
+    if (!whatsappAuthService.canTrade(session)) {
+      return {
+        success: false,
+        response: '',
+        error: 'Trading is not enabled for your account type.'
+      };
+    }
+
+    // Handle order placement using our new regex + AI parsing
+    console.log('[NLP] Attempting to parse order from message:', message);
     const parsedOrder = await NLPParser.parseOrder(message);
     if (parsedOrder) {
-      const user = await prisma.user.findFirst({
-        where: { phone: from.replace('whatsapp:', '') }
-      });
-
-      if (!user) {
-        return {
-          success: false,
-          response: '',
-          error: 'User not found. Please register first.'
-        };
-      }
-
+      console.log('[NLP] Order parsed successfully:', parsedOrder);
+      
       const result = await orderBookService.createOrder(
-        user.id,
+        session.userId,
         parsedOrder.action.toUpperCase() as 'BID' | 'OFFER',
         parsedOrder.price,
         parsedOrder.monthyear,
@@ -273,21 +288,29 @@ export async function processNLPCommand(message: string, from: string): Promise<
         };
       }
 
+      const method = parsedOrder.confidence >= 0.9 ? 'Regex' : 'AI';
+      const userType = session.isRegistered ? session.username : 'Guest';
+      
       return {
         success: true,
-        response: `✅ Order created: ${parsedOrder.action} ${parsedOrder.amount} ${parsedOrder.product} ${parsedOrder.monthyear} @ ${parsedOrder.price}`
+        response: `✅ Order created (${method}) for ${userType}:
+${parsedOrder.action.toUpperCase()} ${parsedOrder.amount} ${parsedOrder.product} ${parsedOrder.monthyear} @ $${parsedOrder.price}
+Order ID: ${result.order.id.slice(0, 8)}
+
+${!session.isRegistered ? '💡 Register at our website to upgrade from guest account!' : ''}`
       };
     }
 
-    // If OpenAI extraction fails
+    // If both regex and AI parsing fail
+    console.log('[NLP] ❌ All parsing methods failed for message:', message);
     return {
       success: false,
       response: '',
-      error: 'Sorry, I could not understand your order. Please try a more direct format like "Buy 100 Dec25 Wheat at 150".'
+      error: 'Sorry, I could not understand your order. Please try a more direct format like "Buy 100 Dec25 Wheat at 150" or type "help" for examples.'
     };
 
   } catch (error) {
-    console.error('Error processing NLP command:', error);
+    console.error('[NLP] Error processing command:', error);
     return {
       success: false,
       response: '',
