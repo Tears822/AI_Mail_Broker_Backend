@@ -1,0 +1,83 @@
+services:
+  - type: web
+    name: mail-server
+    env: node
+    plan: free
+    rootDir: Backend
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
+      - key: JWT_EXPIRY
+        value: 24h
+      - key: COOKIE_SECURE
+        value: true
+      - key: CSRF_ENABLED
+        value: true
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: TWILIO_WHATSAPP_WEBHOOK
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_USERNAME
+        sync: false
+      - key: REDIS_PASSWORD
+        sync: false
+      - key: REDIS_TLS_ENABLED
+        value: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: USE_AI_PARSING
+        value: true
+      - key: AI_MODEL
+        value: gpt-4-turbo
+      - key: WS_PORT
+        value: 8001
+      - key: FRONTEND_URL
+        value: https://webhook.88808880.xyz
+      - key: CORS_ORIGINS
+        value: https://webhook.88808880.xyz,https://admin.your-domain.com,http://localhost:3000
+      - key: RATE_LIMIT_WINDOW_MS
+        value: 900000
+      - key: RATE_LIMIT_MAX
+        value: 100
+      - key: WHATSAPP_RATE_LIMIT
+        value: 5
+      - key: MAX_ORDERS_PER_USER
+        value: 50
+      - key: ORDER_TIMEOUT_HOURS
+        value: 24
+      - key: MATCHING_ENGINE_INTERVAL_MS
+        value: 5000
+      - key: SENTRY_DSN
+        sync: false
+      - key: LOGGING_LEVEL
+        value: info
+      - key: REDIS_HOST
+        sync: false
+      - key: REDIS_PORT
+        value: 10019
+      - key: DIRECT_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
