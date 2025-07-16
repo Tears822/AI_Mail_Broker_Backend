@@ -3,6 +3,9 @@ import { Server as HTTPServer } from 'http';
 import jwt from 'jsonwebtoken';
 import { SECRET_KEY } from '../config';
 import { redisUtils } from '../config/redis';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
 
 export interface SocketUser {
   userId: string;
@@ -129,6 +132,9 @@ export class WebSocketService {
         socket.join('admin');
       }
 
+      // Automatically subscribe user to market rooms for their active orders
+      this.subscribeUserToActiveOrderAssets(user.userId, socket);
+
       // Handle order updates
       socket.on('subscribe_orders', () => {
         socket.join('orders');
@@ -171,6 +177,60 @@ export class WebSocketService {
     });
   }
 
+  /**
+   * Subscribe user to market rooms for assets they have active orders in
+   */
+  private async subscribeUserToActiveOrderAssets(userId: string, socket: any) {
+    try {
+      // Get user's active orders
+      const activeOrders = await prisma.order.findMany({
+        where: {
+          userId,
+          status: 'ACTIVE',
+          remaining: { gt: 0 }
+        },
+        select: { asset: true }
+      });
+
+      // Subscribe to market rooms for each asset
+      const uniqueAssets = [...new Set(activeOrders.map(order => order.asset))];
+      for (const asset of uniqueAssets) {
+        socket.join(`market:${asset}`);
+        console.log(`📈 Auto-subscribed user ${userId} to market:${asset}`);
+      }
+    } catch (error) {
+      console.error('[WebSocket] Error subscribing user to active order assets:', error);
+    }
+  }
+
+  /**
+   * Subscribe a user to a specific asset market room
+   */
+  public subscribeUserToAsset(userId: string, asset: string) {
+    const user = this.connectedUsers.get(userId);
+    if (user) {
+      const socket = this.io.sockets.sockets.get(user.socketId);
+      if (socket) {
+        socket.join(`market:${asset}`);
+        console.log(`📈 User ${userId} subscribed to market:${asset}`);
+      }
+    }
+  }
+
+  /**
+   * Unsubscribe a user from a specific asset market room
+   */
+  public unsubscribeUserFromAsset(userId: string, asset: string) {
+    const user = this.connectedUsers.get(userId);
+    if (user) {
+      const socket = this.io.sockets.sockets.get(user.socketId);
+      if (socket) {
+        socket.leave(`market:${asset}`);
+        console.log(`📈 User ${userId} unsubscribed from market:${asset}`);
+      }
+    }
+  }
+
   private setupRedisSubscriptions() {
     // Subscribe to Redis channels for real-time updates
     redisUtils.subscribe('order:created', (data) => {
@@ -192,6 +252,7 @@ export class WebSocketService {
     redisUtils.subscribe('market:update', (data) => {
       this.broadcastMarketUpdate(data);
     });
+    
     // Subscribe to order:updated and broadcast to all subscribers
     redisUtils.subscribe('order:updated', (data) => {
       this.broadcastOrderUpdated(data);
@@ -200,6 +261,7 @@ export class WebSocketService {
 
   // Broadcast methods
   public broadcastOrderCreated(orderData: any) {
+    // Only broadcast to users who have active orders for the same asset
     this.io.to('orders').emit('order:created', {
       type: 'order_created',
       data: orderData,
@@ -208,7 +270,7 @@ export class WebSocketService {
   }
 
   public broadcastOrderMatched(matchData: any) {
-    // Notify both buyer and seller
+    // Only notify the specific buyer and seller involved in the match
     if (matchData.buyerId) {
       this.io.to(`user:${matchData.buyerId}`).emit('order:matched', {
         type: 'order_matched',
@@ -225,24 +287,40 @@ export class WebSocketService {
       });
     }
 
-    // Broadcast to all users
-    this.io.to('orders').emit('order:matched', {
-      type: 'order_matched',
-      data: matchData,
-      timestamp: new Date().toISOString()
-    });
+    // Only broadcast to users with active orders for the same asset
+    // This allows other traders to see market activity without unnecessary broadcasts
+    if (matchData.asset) {
+      this.io.to(`market:${matchData.asset}`).emit('order:matched', {
+        type: 'order_matched',
+        data: matchData,
+        timestamp: new Date().toISOString()
+      });
+    }
   }
 
   public broadcastOrderCancelled(cancelData: any) {
-    this.io.to('orders').emit('order:cancelled', {
-      type: 'order_cancelled',
-      data: cancelData,
-      timestamp: new Date().toISOString()
-    });
+    // Only notify the order owner who cancelled their order
+    // Order cancellations should not be broadcasted to other users
+    if (cancelData.userId) {
+      console.log(`[WEBSOCKET] Order cancelled notification sent to user ${cancelData.userId}:`, {
+        orderId: cancelData.orderId,
+        asset: cancelData.asset,
+        action: cancelData.action
+      });
+      
+      this.io.to(`user:${cancelData.userId}`).emit('order:cancelled', {
+        type: 'order_cancelled',
+        data: cancelData,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Note: Order cancellations are not broadcasted to other users
+    // Market state changes (price changes) are handled separately by updateOrderBookInRedis
   }
 
   public broadcastTradeExecuted(tradeData: any) {
-    // Notify both parties
+    // Only notify the specific buyer and seller involved in the trade
     if (tradeData.buyerId) {
       this.io.to(`user:${tradeData.buyerId}`).emit('trade:executed', {
         type: 'trade_executed',
@@ -259,28 +337,94 @@ export class WebSocketService {
       });
     }
 
-    // Broadcast to all users
-    this.io.to('trades').emit('trade:executed', {
-      type: 'trade_executed',
-      data: tradeData,
-      timestamp: new Date().toISOString()
-    });
+    // Only broadcast to users with active orders for the same asset
+    // This allows other traders to see market activity without unnecessary broadcasts
+    if (tradeData.asset) {
+      this.io.to(`market:${tradeData.asset}`).emit('trade:executed', {
+        type: 'trade_executed',
+        data: tradeData,
+        timestamp: new Date().toISOString()
+      });
+    }
   }
 
   public broadcastMarketUpdate(marketData: any) {
-    this.io.to('orders').emit('market:update', {
-      type: 'market_update',
-      data: marketData,
-      timestamp: new Date().toISOString()
-    });
+    // Only broadcast to users with active orders for the specific asset
+    if (marketData.asset) {
+      this.io.to(`market:${marketData.asset}`).emit('market:update', {
+        type: 'market_update',
+        data: marketData,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      // If no specific asset, broadcast to all market subscribers
+      this.io.to('orders').emit('market:update', {
+        type: 'market_update',
+        data: marketData,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  /**
+   * Broadcast market price changes to relevant users only
+   * This is called when highest bid or lowest offer prices change
+   */
+  public broadcastMarketPriceChange(priceChangeData: any) {
+    // Only notify users with active orders for the specific asset
+    if (priceChangeData.asset) {
+      this.io.to(`market:${priceChangeData.asset}`).emit('market:priceChanged', {
+        type: 'market_price_changed',
+        data: priceChangeData,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`[MARKET] Price change broadcast for ${priceChangeData.asset}:`, {
+        bidChanged: priceChangeData.changeType?.bidChanged,
+        offerChanged: priceChangeData.changeType?.offerChanged,
+        previousBid: priceChangeData.previousBestBid,
+        currentBid: priceChangeData.bestBid,
+        previousOffer: priceChangeData.previousBestOffer,
+        currentOffer: priceChangeData.bestOffer
+      });
+    }
   }
 
   public broadcastOrderUpdated(orderData: any) {
-    this.io.to('orders').emit('order:updated', {
-      type: 'order_updated',
-      data: orderData,
-      timestamp: new Date().toISOString()
-    });
+    // Only notify the order owner
+    if (orderData.userId) {
+      this.io.to(`user:${orderData.userId}`).emit('order:updated', {
+        type: 'order_updated',
+        data: orderData,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Only broadcast to users with active orders for the same asset if it's a SELLER (OFFER) update
+    // Buyers (BID) updating their orders should not trigger broadcasts to other users
+    if (orderData.asset && orderData.action === 'OFFER') {
+      console.log(`[WEBSOCKET] Broadcasting seller order update for ${orderData.asset}:`, {
+        orderId: orderData.orderId,
+        userId: orderData.userId,
+        action: orderData.action,
+        price: orderData.price,
+        amount: orderData.amount
+      });
+      
+      this.io.to(`market:${orderData.asset}`).emit('order:updated', {
+        type: 'order_updated',
+        data: orderData,
+        timestamp: new Date().toISOString()
+      });
+    } else if (orderData.asset && orderData.action === 'BID') {
+      console.log(`[WEBSOCKET] Skipping broadcast for buyer order update for ${orderData.asset}:`, {
+        orderId: orderData.orderId,
+        userId: orderData.userId,
+        action: orderData.action,
+        price: orderData.price,
+        amount: orderData.amount
+      });
+    }
   }
 
   // Direct user notifications

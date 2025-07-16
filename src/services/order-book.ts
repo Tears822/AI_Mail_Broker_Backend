@@ -93,6 +93,11 @@ export class OrderBookService {
         timestamp: order.createdAt
       });
 
+      // Subscribe user to market room for this asset
+      if (this.wsService) {
+        this.wsService.subscribeUserToAsset(order.userId, order.asset);
+      }
+
       // Update order book in Redis
       await this.updateOrderBookInRedis(asset);
 
@@ -142,6 +147,21 @@ export class OrderBookService {
         asset: order.asset,
         timestamp: new Date().toISOString()
       });
+
+      // Check if user has other active orders for this asset
+      const otherActiveOrders = await prisma.order.findMany({
+        where: {
+          userId: order.userId,
+          asset: order.asset,
+          status: 'ACTIVE',
+          remaining: { gt: 0 }
+        }
+      });
+
+      // Unsubscribe user from market room if no other active orders for this asset
+      if (otherActiveOrders.length === 0 && this.wsService) {
+        this.wsService.unsubscribeUserFromAsset(order.userId, order.asset);
+      }
 
       // Update order book in Redis
       await this.updateOrderBookInRedis(order.asset);
@@ -401,7 +421,7 @@ export class OrderBookService {
       const bestBidChanged = currentBestBid !== (previousBestBid ? parseFloat(previousBestBid) : null);
       const bestOfferChanged = currentBestOffer !== (previousBestOffer ? parseFloat(previousBestOffer) : null);
 
-      // Only broadcast if best prices changed
+      // Only broadcast if highest bid or lowest offer prices have changed
       if (bestBidChanged || bestOfferChanged) {
         console.log(`[MARKET] Best prices changed for ${asset}: Bid ${previousBestBid} -> ${currentBestBid}, Offer ${previousBestOffer} -> ${currentBestOffer}`);
         
@@ -419,6 +439,7 @@ export class OrderBookService {
         }
 
         // Publish market update with price change information
+        // This will be handled by WebSocketService.broadcastMarketUpdate() which targets relevant users
         await redisUtils.publish('market:update', {
           asset,
           bestBid: currentBestBid,
@@ -427,8 +448,28 @@ export class OrderBookService {
           previousBestOffer: previousBestOffer ? parseFloat(previousBestOffer) : null,
           orders: orders.length,
           timestamp: new Date().toISOString(),
-          priceChanged: true
+          priceChanged: true,
+          changeType: {
+            bidChanged: bestBidChanged,
+            offerChanged: bestOfferChanged
+          }
         });
+
+        // Broadcast price change to relevant users only
+        if (this.wsService) {
+          this.wsService.broadcastMarketPriceChange({
+            asset,
+            bestBid: currentBestBid,
+            bestOffer: currentBestOffer,
+            previousBestBid: previousBestBid ? parseFloat(previousBestBid) : null,
+            previousBestOffer: previousBestOffer ? parseFloat(previousBestOffer) : null,
+            changeType: {
+              bidChanged: bestBidChanged,
+              offerChanged: bestOfferChanged
+            },
+            timestamp: new Date().toISOString()
+          });
+        }
       } else {
         console.log(`[MARKET] No price change for ${asset}: Bid ${currentBestBid}, Offer ${currentBestOffer}`);
       }
