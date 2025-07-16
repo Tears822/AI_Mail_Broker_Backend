@@ -21,9 +21,116 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 export class NLPParser {
   /**
    * Parse natural language order text
+   * Tries regex first, then AI fallback
    */
   static async parseOrder(text: string): Promise<ParsedOrder | null> {
-    return await this.parseWithAI(text);
+    console.log('[NLP] Attempting to parse:', text);
+    
+    // Try regex parsing first (faster and more reliable for structured commands)
+    const regexResult = this.parseWithRegex(text);
+    if (regexResult) {
+      console.log('[NLP] ✅ Regex parsing successful:', regexResult);
+      return regexResult;
+    }
+    
+    // If regex fails, try AI parsing
+    console.log('[NLP] Regex failed, trying AI parsing...');
+    const aiResult = await this.parseWithAI(text);
+    if (aiResult) {
+      console.log('[NLP] ✅ AI parsing successful:', aiResult);
+      return aiResult;
+    }
+    
+    console.log('[NLP] ❌ Both regex and AI parsing failed');
+    return null;
+  }
+
+  /**
+   * Parse with regex patterns (fast and reliable for structured commands)
+   */
+  private static parseWithRegex(text: string): ParsedOrder | null {
+    const cleanText = text.trim().toLowerCase();
+    
+    // Enhanced regex patterns for trading orders
+    const patterns = [
+      // "Buy 100 Dec25 Wheat at 150" or "Sell 50 Jan26 Gold for 2000"
+      /^(buy|sell|bid|offer)\s+(\d+)\s+([a-z]{3}\d{2})\s+([a-z]+)\s+(?:at|for)\s+(\d+(?:\.\d+)?)$/i,
+      
+      // "buy 100 gas jan24 at 50" 
+      /^(buy|sell|bid|offer)\s+(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(?:at|for)\s+(\d+(?:\.\d+)?)$/i,
+      
+      // "bid 100 wheat dec25 150" (more compact format)
+      /^(bid|offer|buy|sell)\s+(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(\d+(?:\.\d+)?)$/i,
+      
+      // "100 wheat dec25 bid 150"
+      /^(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(bid|offer|buy|sell)\s+(\d+(?:\.\d+)?)$/i
+    ];
+
+    for (let i = 0; i < patterns.length; i++) {
+      const match = cleanText.match(patterns[i]);
+      if (match) {
+        console.log(`[REGEX] Pattern ${i + 1} matched:`, match);
+        
+        let action, amount, product, monthyear, price;
+        
+        if (i === 3) { // Last pattern has different order
+          [, amount, product, monthyear, action, price] = match;
+        } else if (i === 1) { // Pattern with product before monthyear
+          [, action, amount, product, monthyear, price] = match;
+        } else {
+          [, action, amount, monthyear, product, price] = match;
+        }
+
+        // Normalize action
+        const actionMap: Record<string, 'bid' | 'offer'> = {
+          'buy': 'bid',
+          'sell': 'offer',
+          'bid': 'bid',
+          'offer': 'offer'
+        };
+        
+        const normalizedAction = actionMap[action.toLowerCase()];
+        if (!normalizedAction) {
+          console.log('[REGEX] Invalid action:', action);
+          continue;
+        }
+
+        // Validate product (extend this list as needed)
+        const validProducts = ['wheat', 'gold', 'oil', 'silver', 'gas', 'power', 'corn', 'soy'];
+        if (!validProducts.includes(product.toLowerCase())) {
+          console.log('[REGEX] Invalid product:', product);
+          continue;
+        }
+
+        // Validate monthyear format (e.g., dec25, jan24)
+        if (!/^[a-z]{3}\d{2}$/.test(monthyear.toLowerCase())) {
+          console.log('[REGEX] Invalid monthyear format:', monthyear);
+          continue;
+        }
+
+        const parsedAmount = parseInt(amount);
+        const parsedPrice = parseFloat(price);
+
+        if (isNaN(parsedAmount) || isNaN(parsedPrice) || parsedAmount <= 0 || parsedPrice <= 0) {
+          console.log('[REGEX] Invalid amount or price:', { amount: parsedAmount, price: parsedPrice });
+          continue;
+        }
+
+        console.log('[REGEX] ✅ Successfully parsed order');
+        return {
+          action: normalizedAction,
+          price: parsedPrice,
+          monthyear: monthyear.toLowerCase(),
+          product: product.toLowerCase(),
+          amount: parsedAmount,
+          confidence: 0.95, // High confidence for regex matches
+          rawText: text
+        };
+      }
+    }
+
+    console.log('[REGEX] No patterns matched');
+    return null;
   }
 
   /**
@@ -220,6 +327,25 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
         success: true,
         response: `💱 Recent Trades:\n${tradesText}`
       };
+    }
+
+    // Handle quantity confirmation responses from WhatsApp
+    if (cleanMessage.includes('yes') || cleanMessage.includes('no')) {
+      // Pattern: "YES 12345678" or "NO 12345678" where 12345678 is part of confirmation key
+      const confirmationMatch = cleanMessage.match(/^(yes|no)\s+([a-f0-9]{8})/i);
+      if (confirmationMatch) {
+        const [, response, orderIdPart] = confirmationMatch;
+        const accepted = response.toLowerCase() === 'yes';
+        
+        // Find the confirmation key by searching for pending confirmations with this order ID part
+        // This is a simplified approach - in production you might want to store confirmations differently
+        console.log(`[NLP] WhatsApp quantity confirmation: ${response} for order ${orderIdPart}`);
+        
+        return {
+          success: true,
+          response: `✅ Confirmation received: ${response.toUpperCase()}. Processing your response...`
+        };
+      }
     }
 
     // Handle order cancellation

@@ -12,7 +12,7 @@ const nlpService = new NLPService();
 const authService = new AuthService();
 
 // WhatsApp webhook endpoint
-router.post('/whatsapp', async (req, res) => {
+router.post('/webhook', async (req, res) => {
   try {
     const { Body, From, To } = req.body;
     
@@ -153,7 +153,7 @@ router.post('/whatsapp', async (req, res) => {
 });
 
 // WhatsApp webhook verification (for Twilio)
-router.get('/whatsapp', (req, res) => {
+router.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];

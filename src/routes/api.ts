@@ -7,6 +7,7 @@ import { validateOrderInput } from '../utils';
 import { WebSocketService } from '../services/websocket';
 import { wsService } from '../ws-singleton'; // This file will export the shared wsService instance
 import { whatsappAuthService } from '../services/whatsapp-auth';
+import whatsappRoutes from './whatsapp';
 
 const router = express.Router();
 const authService = new AuthService();
@@ -340,6 +341,9 @@ router.post('/nlp/process', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Mount WhatsApp routes
+router.use('/whatsapp', whatsappRoutes);
 
 export { orderBookService };
 export default router; 

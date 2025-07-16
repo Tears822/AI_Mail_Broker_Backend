@@ -93,6 +93,31 @@ export class OrderBookService {
         timestamp: order.createdAt
       });
 
+      // 📱 WhatsApp notification for order creation
+      const user = await prisma.user.findUnique({
+        where: { id: order.userId },
+        select: { phone: true, username: true }
+      });
+      
+      if (user?.phone) {
+        const orderMessage = `✅ ORDER CREATED!
+
+${order.asset.toUpperCase()} ${order.action}
+Amount: ${order.amount} lots
+Price: $${order.price} per lot
+Total Value: $${(Number(order.amount) * Number(order.price)).toFixed(2)}
+Order ID: ${order.id.slice(0, 8)}
+
+Your order is now active in the market.`;
+        
+        await sendWhatsAppMessage(user.phone, orderMessage);
+        console.log(`📱 Order creation notification sent to ${user.username}`);
+      }
+
+      // Send market status update to other users
+      const marketStatusMessage = `New ${order.action.toLowerCase()} order: ${order.amount} lots @ $${order.price}`;
+      await this.broadcastMarketStatusToWhatsApp(order.asset, marketStatusMessage, order.userId);
+
       // Subscribe user to market room for this asset
       if (this.wsService) {
         this.wsService.subscribeUserToAsset(order.userId, order.asset);
@@ -541,6 +566,47 @@ export class OrderBookService {
       activeAssets,
       totalVolume
     };
+  }
+
+  /**
+   * Broadcast market status updates to WhatsApp for all users with active orders in the asset.
+   */
+  private async broadcastMarketStatusToWhatsApp(asset: string, message: string, excludeUserId?: string): Promise<void> {
+    try {
+      // Get all users with active orders for this asset
+      const activeOrders = await prisma.order.findMany({
+        where: {
+          asset,
+          status: 'ACTIVE',
+          remaining: { gt: 0 },
+          userId: excludeUserId ? { not: excludeUserId } : undefined
+        },
+        include: {
+          user: {
+            select: { phone: true, username: true }
+          }
+        }
+      });
+
+      // Get unique users and send notifications
+      const uniqueUsers = new Map();
+      activeOrders.forEach(order => {
+        if (order.user?.phone && !uniqueUsers.has(order.user.phone)) {
+          uniqueUsers.set(order.user.phone, order.user.username);
+        }
+      });
+
+      const marketMessage = `📊 ${asset.toUpperCase()} MARKET: ${message}`;
+      
+      for (const [phone, username] of uniqueUsers) {
+        await sendWhatsAppMessage(phone, marketMessage);
+        console.log(`📱 Market status sent to ${username}`);
+      }
+      
+      console.log(`[WHATSAPP] Market status sent to ${uniqueUsers.size} users for ${asset}`);
+    } catch (error) {
+      console.error('[WHATSAPP] Error broadcasting market status:', error);
+    }
   }
 }
 

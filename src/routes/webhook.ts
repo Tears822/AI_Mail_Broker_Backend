@@ -14,7 +14,7 @@ router.post('/whatsapp', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const phoneNumber = From.replace('whatsapp:', '');
+    const phoneNumber = From.replace('whatsapp:+', '');
     console.log(`📱 [Webhook] WhatsApp message from ${phoneNumber}: "${Body}"`);
 
     // Authenticate user using WhatsApp auth service

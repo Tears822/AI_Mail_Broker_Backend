@@ -1,6 +1,7 @@
 import { prisma } from '../database/prisma-client';
 import { redisUtils } from '../config/redis';
 import { WebSocketService } from './websocket';
+import { sendWhatsAppMessage } from './whatsapp';
 
 // Remove the PendingApproval interface, pendingSellerApprovals, handleSellerApprovalResponse, and cleanupExpiredPendingTrades
 // Only keep the new negotiation logic and partial fill logic
@@ -21,6 +22,67 @@ export class MatchingEngine {
 
   constructor(wsService: WebSocketService) {
     this.wsService = wsService;
+  }
+
+  /**
+   * Send WhatsApp notification to user by userId
+   */
+  private async notifyUserViaWhatsApp(userId: string, message: string): Promise<void> {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { phone: true, username: true }
+      });
+      
+      if (user?.phone) {
+        await sendWhatsAppMessage(user.phone, message);
+        console.log(`📱 WhatsApp notification sent to ${user.username}: ${message.substring(0, 50)}...`);
+      } else {
+        console.log(`[WHATSAPP] No phone number found for user ${userId}`);
+      }
+    } catch (error) {
+      console.error('[WHATSAPP] Error sending notification:', error);
+    }
+  }
+
+  /**
+   * Send market status update to all users with active orders in an asset
+   */
+  private async broadcastMarketStatusToWhatsApp(asset: string, message: string): Promise<void> {
+    try {
+      // Get all users with active orders for this asset
+      const activeOrders = await prisma.order.findMany({
+        where: {
+          asset,
+          status: 'ACTIVE',
+          remaining: { gt: 0 }
+        },
+        include: {
+          user: {
+            select: { phone: true, username: true }
+          }
+        }
+      });
+
+      // Get unique users and send notifications
+      const uniqueUsers = new Map();
+      activeOrders.forEach(order => {
+        if (order.user?.phone && !uniqueUsers.has(order.user.phone)) {
+          uniqueUsers.set(order.user.phone, order.user.username);
+        }
+      });
+
+      const marketMessage = `📊 ${asset.toUpperCase()} MARKET UPDATE: ${message}`;
+      
+      for (const [phone, username] of uniqueUsers) {
+        await sendWhatsAppMessage(phone, marketMessage);
+        console.log(`📱 Market update sent to ${username}`);
+      }
+      
+      console.log(`[WHATSAPP] Market status broadcast sent to ${uniqueUsers.size} users for ${asset}`);
+    } catch (error) {
+      console.error('[WHATSAPP] Error broadcasting market status:', error);
+    }
   }
 
   public start(): void {
@@ -168,6 +230,21 @@ export class MatchingEngine {
           side: smallerParty === 'BUYER' ? 'BUY' : 'SELL',
           message: `Do you want to ${smallerParty === 'BUYER' ? 'buy' : 'sell'} ${additionalQuantity} additional lots at $${bestBid.price}? (Total would be ${largerQuantity} lots instead of ${smallerQuantity} lots)`
         });
+        
+        // 📱 WhatsApp notification for quantity confirmation
+        const whatsappMessage = `🤝 QUANTITY CONFIRMATION NEEDED
+        
+${asset.toUpperCase()} @ $${bestBid.price}
+Your order: ${smallerQuantity} lots
+Available: ${largerQuantity} lots
+
+Do you want ${additionalQuantity} additional lots?
+Reply "YES ${confirmationKey.split(':')[1]}" to accept
+Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} lots only
+
+⏰ You have 30 seconds to respond.`;
+        
+        await this.notifyUserViaWhatsApp(smallerOrder.userId, whatsappMessage);
         
         // Set a timeout for the confirmation (30 seconds)
         setTimeout(() => {
@@ -501,6 +578,20 @@ export class MatchingEngine {
           tradeId: result.trade.id,
           matchType: result.matchType
         });
+        
+        // 📱 WhatsApp notification for buyer
+        const buyerMessage = `✅ ORDER MATCHED!
+
+${bid.asset.toUpperCase()} Purchase Complete
+Amount: ${tradeAmount} lots
+Price: $${tradePrice} per lot
+Total: $${(tradeAmount * tradePrice).toFixed(2)}
+Order ID: ${bid.id.slice(0, 8)}
+Trade ID: ${result.trade.id.slice(0, 8)}
+
+Your order has been fully executed.`;
+        
+        await this.notifyUserViaWhatsApp(bid.userId, buyerMessage);
       }
       if (result.offerRemaining === 0) {
         console.log('[MATCHING] Offer fully matched, emitting order:matched event');
@@ -513,6 +604,20 @@ export class MatchingEngine {
           tradeId: result.trade.id,
           matchType: result.matchType
         });
+        
+        // 📱 WhatsApp notification for seller
+        const sellerMessage = `✅ ORDER MATCHED!
+
+${offer.asset.toUpperCase()} Sale Complete  
+Amount: ${tradeAmount} lots
+Price: $${tradePrice} per lot
+Total: $${(tradeAmount * tradePrice).toFixed(2)}
+Order ID: ${offer.id.slice(0, 8)}
+Trade ID: ${result.trade.id.slice(0, 8)}
+
+Your order has been fully executed.`;
+        
+        await this.notifyUserViaWhatsApp(offer.userId, sellerMessage);
       }
 
       // Handle partial fills - notify the filled party and broadcast remaining to market
@@ -529,6 +634,19 @@ export class MatchingEngine {
           message: `Your buy order was fully filled. Purchased ${tradeAmount} units at $${tradePrice}.`
         });
 
+        // 📱 WhatsApp notification for buyer (full fill)
+        const buyerFillMessage = `🎯 ORDER FILLED!
+
+${bid.asset.toUpperCase()} Purchase Complete
+Amount: ${tradeAmount} lots  
+Price: $${tradePrice} per lot
+Total: $${(tradeAmount * tradePrice).toFixed(2)}
+Order ID: ${bid.id.slice(0, 8)}
+
+Your buy order was fully executed.`;
+        
+        await this.notifyUserViaWhatsApp(bid.userId, buyerFillMessage);
+
         // Notify seller about partial fill
         this.wsService.notifyUser(offer.userId, 'order:partial_fill', {
           orderId: offer.id,
@@ -540,6 +658,19 @@ export class MatchingEngine {
           tradeId: result.trade.id,
           message: `Your sell order was partially filled. ${tradeAmount} units sold at $${tradePrice}, ${result.offerRemaining} units remaining.`
         });
+
+        // 📱 WhatsApp notification for seller (partial fill)
+        const sellerPartialMessage = `⚡ PARTIAL FILL!
+
+${bid.asset.toUpperCase()} Sale Update
+Sold: ${tradeAmount} lots at $${tradePrice}
+Revenue: $${(tradeAmount * tradePrice).toFixed(2)}
+Remaining: ${result.offerRemaining} lots still for sale
+
+Order ID: ${offer.id.slice(0, 8)}
+Your order is still active for remaining quantity.`;
+        
+        await this.notifyUserViaWhatsApp(offer.userId, sellerPartialMessage);
 
         // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
         this.wsService.broadcastMarketUpdate({
@@ -554,6 +685,12 @@ export class MatchingEngine {
           lastTradeAmount: tradeAmount
         });
 
+        // 📱 Broadcast market status to WhatsApp users
+        await this.broadcastMarketStatusToWhatsApp(
+          bid.asset, 
+          `Trade executed! ${tradeAmount} lots @ $${tradePrice}. ${result.offerRemaining} lots still available for sale.`
+        );
+
       } else if (result.matchType === 'PARTIAL_FILL_SELLER' && result.bidRemaining > 0) {
         console.log(`[MATCHING] 🔄 PARTIAL FILL: Seller filled, buyer has ${result.bidRemaining} remaining`);
         
@@ -567,6 +704,19 @@ export class MatchingEngine {
           message: `Your sell order was fully filled. Sold ${tradeAmount} units at $${tradePrice}.`
         });
 
+        // 📱 WhatsApp notification for seller (full fill)
+        const sellerFillMessage = `🎯 ORDER FILLED!
+
+${bid.asset.toUpperCase()} Sale Complete
+Amount: ${tradeAmount} lots
+Price: $${tradePrice} per lot  
+Total: $${(tradeAmount * tradePrice).toFixed(2)}
+Order ID: ${offer.id.slice(0, 8)}
+
+Your sell order was fully executed.`;
+        
+        await this.notifyUserViaWhatsApp(offer.userId, sellerFillMessage);
+
         // Notify buyer about partial fill
         this.wsService.notifyUser(bid.userId, 'order:partial_fill', {
           orderId: bid.id,
@@ -578,6 +728,19 @@ export class MatchingEngine {
           tradeId: result.trade.id,
           message: `Your buy order was partially filled. ${tradeAmount} units purchased at $${tradePrice}, ${result.bidRemaining} units remaining.`
         });
+
+        // 📱 WhatsApp notification for buyer (partial fill)
+        const buyerPartialMessage = `⚡ PARTIAL FILL!
+
+${bid.asset.toUpperCase()} Purchase Update
+Bought: ${tradeAmount} lots at $${tradePrice}
+Cost: $${(tradeAmount * tradePrice).toFixed(2)}
+Still needed: ${result.bidRemaining} lots
+
+Order ID: ${bid.id.slice(0, 8)}
+Your order is still active for remaining quantity.`;
+        
+        await this.notifyUserViaWhatsApp(bid.userId, buyerPartialMessage);
 
         // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
         this.wsService.broadcastMarketUpdate({
@@ -591,6 +754,12 @@ export class MatchingEngine {
           lastTradePrice: tradePrice,
           lastTradeAmount: tradeAmount
         });
+
+        // 📱 Broadcast market status to WhatsApp users
+        await this.broadcastMarketStatusToWhatsApp(
+          bid.asset, 
+          `Trade executed! ${tradeAmount} lots @ $${tradePrice}. ${result.bidRemaining} lots still wanted for purchase.`
+        );
       } else {
         // Full match - broadcast successful trade completion
         this.wsService.broadcastMarketUpdate({
@@ -601,6 +770,12 @@ export class MatchingEngine {
           lastTradePrice: tradePrice,
           lastTradeAmount: tradeAmount
         });
+        
+        // 📱 Broadcast full trade completion to WhatsApp users
+        await this.broadcastMarketStatusToWhatsApp(
+          bid.asset, 
+          `Full trade completed! ${tradeAmount} lots @ $${tradePrice}. Market cleared for this price level.`
+        );
       }
 
       // Always broadcast updated market data to show new best orders after this trade
