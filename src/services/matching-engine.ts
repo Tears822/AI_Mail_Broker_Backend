@@ -132,7 +132,58 @@ export class MatchingEngine {
     const bestBid = bids.sort((a, b) => Number(b.price) - Number(a.price) || a.createdAt - b.createdAt)[0];
     const bestOffer = offers.sort((a, b) => Number(a.price) - Number(b.price) || a.createdAt - b.createdAt)[0];
 
-    // If there is no negotiation state, start one
+    // Check if prices match for potential trade
+    if (Number(bestBid.price) === Number(bestOffer.price)) {
+      const bidQuantity = Number(bestBid.remaining);
+      const offerQuantity = Number(bestOffer.remaining);
+      
+      console.log(`[MATCHING] Price match found for ${asset}: Bid ${bidQuantity} @ ${bestBid.price}, Offer ${offerQuantity} @ ${bestOffer.price}`);
+      
+      // Check for quantity mismatch
+      if (bidQuantity !== offerQuantity) {
+        const smallerQuantity = Math.min(bidQuantity, offerQuantity);
+        const largerQuantity = Math.max(bidQuantity, offerQuantity);
+        const additionalQuantity = largerQuantity - smallerQuantity;
+        
+        // Determine which party has the smaller quantity (they get asked to increase)
+        const smallerParty = bidQuantity < offerQuantity ? 'BUYER' : 'SELLER';
+        const smallerOrder = bidQuantity < offerQuantity ? bestBid : bestOffer;
+        const largerOrder = bidQuantity < offerQuantity ? bestOffer : bestBid;
+        
+        console.log(`[MATCHING] Quantity mismatch detected: ${smallerParty} has ${smallerQuantity}, other party has ${largerQuantity}. Asking ${smallerParty} if they want additional ${additionalQuantity} lots.`);
+        
+        // Create a pending quantity confirmation
+        const confirmationKey = `${asset}:${bestBid.id}:${bestOffer.id}`;
+        
+        // Send confirmation request to the smaller party
+        this.wsService.notifyUser(smallerOrder.userId, 'quantity:confirmation_request', {
+          confirmationKey,
+          asset,
+          yourOrderId: smallerOrder.id,
+          counterpartyOrderId: largerOrder.id,
+          yourQuantity: smallerQuantity,
+          counterpartyQuantity: largerQuantity,
+          additionalQuantity,
+          price: bestBid.price, // Trade price
+          side: smallerParty === 'BUYER' ? 'BUY' : 'SELL',
+          message: `Do you want to ${smallerParty === 'BUYER' ? 'buy' : 'sell'} ${additionalQuantity} additional lots at $${bestBid.price}? (Total would be ${largerQuantity} lots instead of ${smallerQuantity} lots)`
+        });
+        
+        // Set a timeout for the confirmation (30 seconds)
+        setTimeout(() => {
+          console.log(`[MATCHING] Quantity confirmation timeout for ${confirmationKey}, proceeding with partial trade`);
+          this.handleQuantityConfirmationResponse(confirmationKey, false);
+        }, 30000);
+        
+        return; // Wait for confirmation before proceeding
+      }
+      
+      // If quantities match exactly, proceed with immediate execution
+      await this.executeMatch(bestBid, bestOffer);
+      return;
+    }
+
+    // If no negotiation state, start one
     if (!this.negotiationState.has(asset)) {
       this.negotiationState.set(asset, {
         bestBid,
@@ -162,15 +213,6 @@ export class MatchingEngine {
       this.notifyNegotiation(asset);
       return;
     }
-    // If prices match, execute trade
-    if (Number(state.bestBid.price) === Number(state.bestOffer.price)) {
-      await this.executeMatch(state.bestBid, state.bestOffer);
-      if (state.timeout) clearTimeout(state.timeout);
-      this.negotiationState.delete(asset);
-      return;
-    }
-    // If no improvement, broadcast to all and clear negotiation
-    // (handled in notifyNegotiation on timeout)
   }
 
   // Notify the counterparty in negotiation
@@ -269,11 +311,84 @@ export class MatchingEngine {
     }
   }
 
+  // Handle quantity confirmation responses
+  public async handleQuantityConfirmationResponse(confirmationKey: string, accepted: boolean, newQuantity?: number) {
+    console.log(`[MATCHING] Quantity confirmation response: ${confirmationKey}, accepted: ${accepted}, newQuantity: ${newQuantity}`);
+    
+    const [asset, bidId, offerId] = confirmationKey.split(':');
+    
+    try {
+      // Get the current orders
+      const bid = await prisma.order.findUnique({ where: { id: bidId } });
+      const offer = await prisma.order.findUnique({ where: { id: offerId } });
+      
+      if (!bid || !offer) {
+        console.error(`[MATCHING] Orders not found for confirmation: ${bidId}, ${offerId}`);
+        return;
+      }
+      
+      if (accepted && newQuantity) {
+        // User accepted and wants to increase their order quantity
+        const smallerParty = Number(bid.remaining) < Number(offer.remaining) ? 'BUYER' : 'SELLER';
+        
+        if (smallerParty === 'BUYER') {
+          // Update buyer's order to match seller's quantity
+          await prisma.order.update({
+            where: { id: bidId },
+            data: { 
+              amount: newQuantity,
+              remaining: newQuantity
+            }
+          });
+          console.log(`[MATCHING] Updated buyer order ${bidId} to ${newQuantity} lots`);
+        } else {
+          // Update seller's order to match buyer's quantity
+          await prisma.order.update({
+            where: { id: offerId },
+            data: { 
+              amount: newQuantity,
+              remaining: newQuantity
+            }
+          });
+          console.log(`[MATCHING] Updated seller order ${offerId} to ${newQuantity} lots`);
+        }
+        
+        // Now both orders have matching quantities, execute the trade
+        const updatedBid = await prisma.order.findUnique({ where: { id: bidId } });
+        const updatedOffer = await prisma.order.findUnique({ where: { id: offerId } });
+        
+        if (updatedBid && updatedOffer) {
+          await this.executeMatch(updatedBid, updatedOffer);
+        }
+      } else {
+        // User declined or timeout, proceed with partial trade for smaller quantity
+        console.log(`[MATCHING] User declined additional quantity or timeout, proceeding with partial trade`);
+        await this.executeMatch(bid, offer);
+      }
+      
+    } catch (error) {
+      console.error('[MATCHING] Error handling quantity confirmation response:', error);
+    }
+  }
+
   private async executeMatch(bid: any, offer: any): Promise<void> {
     try {
       const tradeAmount = Math.min(Number(bid.remaining), Number(offer.remaining));
       const tradePrice = Number(offer.price);
       const commission = this.calculateCommission(tradeAmount, tradePrice);
+
+      // Determine the type of match
+      const bidQuantity = Number(bid.remaining);
+      const offerQuantity = Number(offer.remaining);
+      let matchType: 'FULL_MATCH' | 'PARTIAL_FILL_BUYER' | 'PARTIAL_FILL_SELLER';
+      
+      if (bidQuantity === offerQuantity) {
+        matchType = 'FULL_MATCH';
+      } else if (bidQuantity < offerQuantity) {
+        matchType = 'PARTIAL_FILL_BUYER'; // Buyer gets filled, seller has remaining
+      } else {
+        matchType = 'PARTIAL_FILL_SELLER'; // Seller gets filled, buyer has remaining
+      }
 
       console.log('[MATCHING] Attempting to create trade:', {
         asset: bid.asset,
@@ -283,7 +398,12 @@ export class MatchingEngine {
         sellerOrderId: offer.id,
         commission,
         buyerId: bid.userId,
-        sellerId: offer.userId
+        sellerId: offer.userId,
+        matchType,
+        bidQuantity,
+        offerQuantity,
+        scenario: matchType === 'PARTIAL_FILL_BUYER' ? 'SELLER_QUANTITY_GREATER_THAN_BUYER' : 
+                 matchType === 'PARTIAL_FILL_SELLER' ? 'BUYER_QUANTITY_GREATER_THAN_SELLER' : 'EXACT_MATCH'
       });
 
       // Execute match with minimal database operations
@@ -329,34 +449,26 @@ export class MatchingEngine {
         });
         console.log('[MATCHING] Updated Offer Order:', updatedOffer);
 
-        // Emit order:matched events for both orders if fully matched
-        if (bidRemaining === 0) {
-          console.log('[MATCHING] Bid fully matched, emitting order:matched event');
-          this.wsService.notifyUser(bid.userId, 'order:matched', {
-            orderId: bid.id,
-            status: 'MATCHED',
-            asset: bid.asset,
-            price: tradePrice,
-            amount: tradeAmount
-          });
-        }
-        if (offerRemaining === 0) {
-          console.log('[MATCHING] Offer fully matched, emitting order:matched event');
-          this.wsService.notifyUser(offer.userId, 'order:matched', {
-            orderId: offer.id,
-            status: 'MATCHED',
-            asset: offer.asset,
-            price: tradePrice,
-            amount: tradeAmount
-          });
+        // Log the specific scenario results
+        if (matchType === 'PARTIAL_FILL_BUYER') {
+          console.log(`[MATCHING] ✅ SELLER_QUANTITY > BUYER_QUANTITY: Buyer fully filled (${tradeAmount}), Seller has ${offerRemaining} remaining`);
+        } else if (matchType === 'PARTIAL_FILL_SELLER') {
+          console.log(`[MATCHING] ✅ BUYER_QUANTITY > SELLER_QUANTITY: Seller fully filled (${tradeAmount}), Buyer has ${bidRemaining} remaining`);
+        } else {
+          console.log(`[MATCHING] ✅ EXACT_MATCH: Both orders fully filled (${tradeAmount})`);
         }
 
-        return { trade, bidRemaining, offerRemaining };
+        return { trade, bidRemaining, offerRemaining, updatedBid, updatedOffer, matchType };
       });
 
       if (!result.trade) {
         console.error('[MATCHING] Trade was not created!');
+        return;
       }
+
+      // Update order book in Redis FIRST, before publishing events
+      await (new (require('./order-book').OrderBookService)()).updateOrderBookInRedis(bid.asset);
+      console.log('[MATCHING] Order book updated in Redis for asset:', bid.asset);
 
       // Publish trade event for trade board
       await redisUtils.publish('trade:executed', {
@@ -366,13 +478,145 @@ export class MatchingEngine {
         amount: result.trade.amount,
         buyerId: result.trade.buyerId,
         sellerId: result.trade.sellerId,
-        timestamp: result.trade.createdAt
+        timestamp: result.trade.createdAt,
+        // Include order update information for frontend
+        bidFullyMatched: result.bidRemaining === 0,
+        offerFullyMatched: result.offerRemaining === 0,
+        bidOrderId: bid.id,
+        offerOrderId: offer.id,
+        matchType: result.matchType,
+        partialFill: result.matchType !== 'FULL_MATCH'
       });
       console.log('[MATCHING] Trade event published for trade board.');
 
-      // After publishing trade event and before handling partial fill logic
-      await (new (require('./order-book').OrderBookService)()).updateOrderBookInRedis(bid.asset);
-      console.log('[MATCHING] Order book updated in Redis for asset:', bid.asset);
+      // Emit order:matched events for both orders if fully matched
+      if (result.bidRemaining === 0) {
+        console.log('[MATCHING] Bid fully matched, emitting order:matched event');
+        this.wsService.notifyUser(bid.userId, 'order:matched', {
+          orderId: bid.id,
+          status: 'MATCHED',
+          asset: bid.asset,
+          price: tradePrice,
+          amount: tradeAmount,
+          tradeId: result.trade.id,
+          matchType: result.matchType
+        });
+      }
+      if (result.offerRemaining === 0) {
+        console.log('[MATCHING] Offer fully matched, emitting order:matched event');
+        this.wsService.notifyUser(offer.userId, 'order:matched', {
+          orderId: offer.id,
+          status: 'MATCHED',
+          asset: bid.asset,
+          price: tradePrice,
+          amount: tradeAmount,
+          tradeId: result.trade.id,
+          matchType: result.matchType
+        });
+      }
+
+      // Handle partial fills - notify the filled party and broadcast remaining to market
+      if (result.matchType === 'PARTIAL_FILL_BUYER' && result.offerRemaining > 0) {
+        console.log(`[MATCHING] 🔄 PARTIAL FILL: Buyer filled, seller has ${result.offerRemaining} remaining`);
+        
+        // Notify buyer about full fill
+        this.wsService.notifyUser(bid.userId, 'order:filled', {
+          orderId: bid.id,
+          asset: bid.asset,
+          amount: tradeAmount,
+          price: tradePrice,
+          tradeId: result.trade.id,
+          message: `Your buy order was fully filled. Purchased ${tradeAmount} units at $${tradePrice}.`
+        });
+
+        // Notify seller about partial fill
+        this.wsService.notifyUser(offer.userId, 'order:partial_fill', {
+          orderId: offer.id,
+          asset: bid.asset,
+          originalAmount: offer.amount,
+          filledAmount: tradeAmount,
+          remainingAmount: result.offerRemaining,
+          price: tradePrice,
+          tradeId: result.trade.id,
+          message: `Your sell order was partially filled. ${tradeAmount} units sold at $${tradePrice}, ${result.offerRemaining} units remaining.`
+        });
+
+        // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
+        this.wsService.broadcastMarketUpdate({
+          asset: bid.asset,
+          type: 'remaining_quantity_available',
+          action: 'OFFER', // Remaining quantity is for sale
+          remainingQuantity: result.offerRemaining,
+          price: tradePrice,
+          message: `🔥 TRADE EXECUTED: ${tradeAmount} ${bid.asset} @ $${tradePrice}. ${result.offerRemaining} lots still available for sale at $${tradePrice}!`,
+          tradeExecuted: true,
+          lastTradePrice: tradePrice,
+          lastTradeAmount: tradeAmount
+        });
+
+      } else if (result.matchType === 'PARTIAL_FILL_SELLER' && result.bidRemaining > 0) {
+        console.log(`[MATCHING] 🔄 PARTIAL FILL: Seller filled, buyer has ${result.bidRemaining} remaining`);
+        
+        // Notify seller about full fill
+        this.wsService.notifyUser(offer.userId, 'order:filled', {
+          orderId: offer.id,
+          asset: bid.asset,
+          amount: tradeAmount,
+          price: tradePrice,
+          tradeId: result.trade.id,
+          message: `Your sell order was fully filled. Sold ${tradeAmount} units at $${tradePrice}.`
+        });
+
+        // Notify buyer about partial fill
+        this.wsService.notifyUser(bid.userId, 'order:partial_fill', {
+          orderId: bid.id,
+          asset: bid.asset,
+          originalAmount: bid.amount,
+          filledAmount: tradeAmount,
+          remainingAmount: result.bidRemaining,
+          price: tradePrice,
+          tradeId: result.trade.id,
+          message: `Your buy order was partially filled. ${tradeAmount} units purchased at $${tradePrice}, ${result.bidRemaining} units remaining.`
+        });
+
+        // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
+        this.wsService.broadcastMarketUpdate({
+          asset: bid.asset,
+          type: 'remaining_quantity_available',
+          action: 'BID', // Remaining quantity is wanted for purchase
+          remainingQuantity: result.bidRemaining,
+          price: tradePrice,
+          message: `🔥 TRADE EXECUTED: ${tradeAmount} ${bid.asset} @ $${tradePrice}. ${result.bidRemaining} lots still wanted at $${tradePrice}!`,
+          tradeExecuted: true,
+          lastTradePrice: tradePrice,
+          lastTradeAmount: tradeAmount
+        });
+      } else {
+        // Full match - broadcast successful trade completion
+        this.wsService.broadcastMarketUpdate({
+          asset: bid.asset,
+          type: 'trade_completed',
+          message: `✅ TRADE COMPLETED: ${tradeAmount} ${bid.asset} @ $${tradePrice}`,
+          tradeExecuted: true,
+          lastTradePrice: tradePrice,
+          lastTradeAmount: tradeAmount
+        });
+      }
+
+      // Always broadcast updated market data to show new best orders after this trade
+      const updatedMarketData = await (new (require('./order-book').OrderBookService)()).getMarketData();
+      const assetMarketData = updatedMarketData.find((m: any) => m.asset === bid.asset);
+      
+      if (assetMarketData) {
+        this.wsService.broadcastMarketUpdate({
+          asset: bid.asset,
+          ...assetMarketData,
+          tradeExecuted: true,
+          lastTradePrice: tradePrice,
+          lastTradeAmount: tradeAmount,
+          matchType: result.matchType
+        });
+      }
 
       // Handle partial fill logic
       if (result.bidRemaining > 0 && result.offerRemaining === 0) {

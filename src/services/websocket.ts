@@ -163,6 +163,16 @@ export class WebSocketService {
         }
       });
 
+      // Handle quantity confirmation responses
+      socket.on('quantity:confirmation_response', (data: any) => {
+        console.log(`[WEBSOCKET] Received quantity:confirmation_response from ${user.username}:`, data);
+        if (this.matchingEngine && data.confirmationKey && data.accepted !== undefined) {
+          this.matchingEngine.handleQuantityConfirmationResponse(data.confirmationKey, data.accepted, data.newQuantity);
+        } else {
+          console.warn('[WEBSOCKET] Invalid quantity:confirmation_response data:', data);
+        }
+      });
+
       // Handle disconnect
       socket.on('disconnect', () => {
         console.log(`🔌 User disconnected: ${user.username} (${user.userId})`);

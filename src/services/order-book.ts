@@ -303,15 +303,24 @@ export class OrderBookService {
 
   /**
    * Get market data for all assets (return all bids and offers, not just best price/total)
+   * Ensures matched orders are properly excluded from marketplace display
    */
   async getMarketData(): Promise<any[]> {
     try {
+      // Only get ACTIVE orders with remaining quantity > 0
+      // This ensures matched orders (status = 'MATCHED') are excluded
       const orders = await prisma.order.findMany({
         where: {
           status: 'ACTIVE',
           remaining: { gt: 0 }
-        }
+        },
+        orderBy: [
+          { price: 'desc' },
+          { createdAt: 'asc' }
+        ]
       });
+
+      console.log(`[ORDER_BOOK] Found ${orders.length} active orders for market data`);
 
       // Group by asset
       const marketData: Record<string, any> = {};
@@ -324,14 +333,34 @@ export class OrderBookService {
           };
         }
         if (order.action === 'BID') {
-          marketData[order.asset].bids.push(order);
+          marketData[order.asset].bids.push({
+            id: order.id,
+            price: order.price,
+            remaining: order.remaining,
+            userId: order.userId,
+            createdAt: order.createdAt
+          });
         } else {
-          marketData[order.asset].offers.push(order);
+          marketData[order.asset].offers.push({
+            id: order.id,
+            price: order.price,
+            remaining: order.remaining,
+            userId: order.userId,
+            createdAt: order.createdAt
+          });
         }
       });
 
-      // Return all bids and offers for each asset
-      return Object.values(marketData);
+      // Sort bids (highest price first) and offers (lowest price first)
+      Object.values(marketData).forEach((data: any) => {
+        data.bids.sort((a: any, b: any) => Number(b.price) - Number(a.price) || new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+        data.offers.sort((a: any, b: any) => Number(a.price) - Number(b.price) || new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      });
+
+      const result = Object.values(marketData);
+      console.log(`[ORDER_BOOK] Returning market data for ${result.length} assets`);
+      
+      return result;
     } catch (error) {
       console.error('Error fetching market data:', error);
       return [];
