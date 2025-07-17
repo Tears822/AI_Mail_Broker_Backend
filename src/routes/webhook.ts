@@ -1,42 +1,36 @@
-import { Router } from 'express';
+import express from 'express';
 import { processWhatsAppMessage } from '../services/whatsapp';
-import { whatsappAuthService } from '../services/whatsapp-auth';
+import { normalizePhoneNumber } from '../utils';
 
-const router = Router();
+const router = express.Router();
 
-// WhatsApp webhook endpoint
+// WhatsApp webhook endpoint for processing messages
 router.post('/whatsapp', async (req, res) => {
   try {
+    console.log('📱 [Webhook] Received WhatsApp webhook:', req.body);
+
     const { Body, From, To } = req.body;
     
     if (!Body || !From) {
-      console.log('[Webhook] Missing required fields:', { Body: !!Body, From: !!From });
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const phoneNumber = From.replace('whatsapp:+', '');
-    console.log(`📱 [Webhook] WhatsApp message from ${phoneNumber}: "${Body}"`);
-
-    // Authenticate user using WhatsApp auth service
-    try {
-      const session = await whatsappAuthService.authenticateUser(phoneNumber);
-      console.log(`[Webhook] User authenticated: ${session.username} (${session.isRegistered ? 'Registered' : 'Guest'})`);
-    } catch (error) {
-      console.error('[Webhook] Authentication failed:', error);
-      return res.status(500).json({ error: 'Authentication failed' });
-    }
-
-    // Process the message
-    const response = await processWhatsAppMessage(Body, From);
+    const message = Body.trim();
+    const phoneNumber = normalizePhoneNumber(From);
     
-    console.log(`[Webhook] Response sent to ${phoneNumber}:`, response);
+    console.log(`📱 [Webhook] WhatsApp message from ${phoneNumber}: "${message}"`);
+
+    // Process the message using the WhatsApp service (which handles both processing and sending response)
+    const response = await processWhatsAppMessage(message, phoneNumber);
     
-    res.json({
-      success: true,
-      response
+    console.log(`[Webhook] Response processed for ${phoneNumber}: ${response}`);
+    return res.status(200).json({ 
+      success: true, 
+      response: response 
     });
+
   } catch (error) {
-    console.error('[Webhook] Error:', error);
+    console.error('[Webhook] Error processing WhatsApp webhook:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

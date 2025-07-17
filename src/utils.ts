@@ -156,6 +156,27 @@ export function normalizeDate(dateStr: string): string {
 }
 
 /**
+ * Normalize phone number for WhatsApp integration
+ * Ensures consistent phone number format across the application
+ */
+export function normalizePhoneNumber(phoneNumber: string): string {
+  if (!phoneNumber) return '';
+  
+  // Remove whatsapp: prefix if present
+  let normalized = phoneNumber.replace(/^whatsapp:(\+)?/, '');
+  
+  // Ensure it starts with + for international format
+  if (!normalized.startsWith('+')) {
+    normalized = '+' + normalized;
+  }
+  
+  // Remove any spaces, dashes, or other characters
+  normalized = normalized.replace(/[\s\-\(\)]/g, '');
+  
+  return normalized;
+}
+
+/**
  * Get best bid and offer for each asset.
  */
 export function getBestOrders(orderBook: Record<string, Order[]>): Record<string, { bid?: Order; offer?: Order }> {

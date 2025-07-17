@@ -1,5 +1,6 @@
 import { prisma } from '../database/prisma-client';
 import { redisUtils } from '../config/redis';
+import { normalizePhoneNumber } from '../utils';
 import bcrypt from 'bcryptjs';
 
 export interface WhatsAppUser {
@@ -28,6 +29,7 @@ export interface WhatsAppSession {
  * Handles phone-based authentication without requiring JWT tokens
  */
 export class WhatsAppAuthService {
+  private activeSessions: Map<string, WhatsAppSession> = new Map();
   
   /**
    * Find or create a WhatsApp user by phone number
@@ -35,11 +37,13 @@ export class WhatsAppAuthService {
    */
   async findOrCreateUser(phoneNumber: string): Promise<WhatsAppUser> {
     try {
-      console.log('[WhatsApp Auth] Looking up user by phone:', phoneNumber);
+      // Always normalize the phone number first
+      const normalizedPhone = normalizePhoneNumber(phoneNumber);
+      console.log('[WhatsApp Auth] Looking up user by phone:', normalizedPhone);
       
-      // Always try to find existing user by phone number first
+      // Always try to find existing user by normalized phone number first
       let user = await prisma.user.findFirst({
-        where: { phone: phoneNumber }
+        where: { phone: normalizedPhone }
       });
 
       if (user) {
@@ -48,12 +52,12 @@ export class WhatsAppAuthService {
         // Determine if this is a registered user or WhatsApp-created guest
         const isRegistered = !user.username.startsWith('WhatsApp_') && 
                            !user.email.includes('@whatsapp.temp');
-        
+
         return {
           id: user.id,
           username: user.username,
-          phone: user.phone || phoneNumber,
-          email: user.email || undefined,
+          phone: user.phone,
+          email: user.email,
           role: user.role,
           isRegistered,
           isActive: user.isActive,
@@ -61,62 +65,73 @@ export class WhatsAppAuthService {
         };
       }
 
-      // No user found - create a WhatsApp guest user
-      // This guest user can later be "claimed" when they register on web
-      console.log('[WhatsApp Auth] Creating WhatsApp guest user for phone:', phoneNumber);
-      const guestUsername = `WhatsApp_${phoneNumber.slice(-4)}_${Date.now().toString().slice(-4)}`;
+      // Create new WhatsApp guest user if not found
+      console.log('[WhatsApp Auth] Creating WhatsApp guest user for phone:', normalizedPhone);
       
-      user = await prisma.user.create({
+      // Generate unique username from phone number
+      const phoneDigits = normalizedPhone.replace(/\D/g, '').slice(-4);
+      const randomSuffix = Math.floor(Math.random() * 9000) + 1000;
+      const username = `WhatsApp_${phoneDigits}_${randomSuffix}`;
+      
+      // Check if username already exists and make it unique
+      let finalUsername = username;
+      let counter = 1;
+      while (await prisma.user.findUnique({ where: { username: finalUsername } })) {
+        finalUsername = `${username}_${counter}`;
+        counter++;
+      }
+
+      const newUser = await prisma.user.create({
         data: {
-          username: guestUsername,
-          email: `${guestUsername}@whatsapp.temp`,
-          phone: phoneNumber, // Phone is the key for linking accounts
-          passwordHash: await bcrypt.hash('whatsapp_temp_pass', 10),
+          username: finalUsername,
+          email: `${finalUsername}@whatsapp.temp`,
+          passwordHash: await bcrypt.hash('whatsapp_temp_' + Date.now(), 10),
+          phone: normalizedPhone,
           role: 'TRADER',
-          isActive: true,
-          lastLoginAt: new Date()
+          isActive: true
         }
       });
 
-      console.log('[WhatsApp Auth] Created WhatsApp guest user:', user.username);
-      
+      console.log('[WhatsApp Auth] Created WhatsApp guest user:', finalUsername);
+
       return {
-        id: user.id,
-        username: user.username,
-        phone: user.phone || phoneNumber,
-        email: user.email || undefined,
-        role: user.role,
-        isRegistered: false, // Mark as guest user
-        isActive: user.isActive,
-        lastLoginAt: user.lastLoginAt || undefined
+        id: newUser.id,
+        username: newUser.username,
+        phone: newUser.phone,
+        email: newUser.email,
+        role: newUser.role,
+        isRegistered: false,
+        isActive: newUser.isActive,
+        lastLoginAt: newUser.lastLoginAt || undefined
       };
 
     } catch (error) {
       console.error('[WhatsApp Auth] Error finding/creating user:', error);
-      throw new Error('Failed to authenticate WhatsApp user');
+      throw error;
     }
   }
 
   /**
-   * Create a temporary session for WhatsApp user
+   * Create session for WhatsApp user
    */
   async createSession(user: WhatsAppUser): Promise<WhatsAppSession> {
     try {
-      const sessionKey = `whatsapp_session:${user.phone}`;
-      const expiresIn = 24 * 60 * 60; // 24 hours in seconds
+      const normalizedPhone = normalizePhoneNumber(user.phone);
+      const sessionKey = `whatsapp_session:${normalizedPhone}`;
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
       
       const session: WhatsAppSession = {
         userId: user.id,
-        phone: user.phone,
+        phone: normalizedPhone,
         username: user.username,
         role: user.role,
         isRegistered: user.isRegistered,
         createdAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString()
+        expiresAt: expiresAt.toISOString()
       };
 
-      // Store session in Redis with expiration
-      await redisUtils.set(sessionKey, JSON.stringify(session), expiresIn);
+      // Store session in Redis with 24 hour expiration
+      await redisUtils.set(sessionKey, JSON.stringify(session), 24 * 60 * 60);
       
       console.log('[WhatsApp Auth] Created session for user:', user.username);
       return session;
@@ -128,13 +143,14 @@ export class WhatsAppAuthService {
   }
 
   /**
-   * Get active session for phone number
+   * Get existing session for phone number
    */
   async getSession(phoneNumber: string): Promise<WhatsAppSession | null> {
     try {
-      const sessionKey = `whatsapp_session:${phoneNumber}`;
-      const sessionData = await redisUtils.get(sessionKey);
+      const normalizedPhone = normalizePhoneNumber(phoneNumber);
+      const sessionKey = `whatsapp_session:${normalizedPhone}`;
       
+      const sessionData = await redisUtils.get(sessionKey);
       if (!sessionData) {
         return null;
       }
@@ -142,7 +158,7 @@ export class WhatsAppAuthService {
       const session: WhatsAppSession = JSON.parse(sessionData);
       
       // Check if session is expired
-      if (new Date() > new Date(session.expiresAt)) {
+      if (new Date(session.expiresAt) < new Date()) {
         await redisUtils.del(sessionKey);
         return null;
       }
@@ -156,36 +172,67 @@ export class WhatsAppAuthService {
   }
 
   /**
-   * Authenticate WhatsApp user and return session
+   * Authenticate WhatsApp user by phone number
+   * Creates guest account if needed
    */
   async authenticateUser(phoneNumber: string): Promise<WhatsAppSession> {
     try {
-      console.log('[WhatsApp Auth] Authenticating user:', phoneNumber);
-      
-      // Check for existing session first
-      let session = await this.getSession(phoneNumber);
-      if (session) {
-        console.log('[WhatsApp Auth] Using existing session for:', session.username);
-        return session;
+      const normalizedPhone = normalizePhoneNumber(phoneNumber);
+      console.log('[WhatsApp Auth] Authenticating user:', normalizedPhone);
+
+      // Check if we have a cached session
+      const existingSession = this.activeSessions.get(normalizedPhone);
+      if (existingSession && new Date(existingSession.expiresAt) > new Date()) {
+        console.log('[WhatsApp Auth] Using cached session for:', existingSession.username);
+        
+        // VERIFY the user still exists in database
+        const userExists = await prisma.user.findUnique({
+          where: { id: existingSession.userId }
+        });
+        
+        if (userExists) {
+          console.log('[WhatsApp Auth] User verified in database:', userExists.username);
+          return existingSession;
+        } else {
+          console.log('[WhatsApp Auth] User not found in database, removing cached session and recreating');
+          this.activeSessions.delete(normalizedPhone);
+        }
       }
 
       // Find or create user
-      const user = await this.findOrCreateUser(phoneNumber);
+      const whatsappUser = await this.findOrCreateUser(normalizedPhone);
       
-      // Update last login
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date() }
+      // DOUBLE-CHECK user exists in database
+      const dbUser = await prisma.user.findUnique({
+        where: { id: whatsappUser.id }
       });
+      
+      if (!dbUser) {
+        console.error('[WhatsApp Auth] Critical error: User creation failed or user missing from database');
+        throw new Error('User authentication failed - database inconsistency');
+      }
 
       // Create new session
-      session = await this.createSession(user);
-      
-      console.log('[WhatsApp Auth] Authentication successful for:', user.username);
-      return session;
+      const session: WhatsAppSession = {
+        userId: whatsappUser.id,
+        phone: whatsappUser.phone,
+        username: whatsappUser.username,
+        role: whatsappUser.role,
+        isRegistered: whatsappUser.isRegistered,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 hours
+      };
 
+      // Cache the session
+      this.activeSessions.set(normalizedPhone, session);
+      console.log('[WhatsApp Auth] New session created for:', whatsappUser.username);
+
+      // Store in Redis for persistence
+      await redisUtils.setUserSession(`whatsapp:${normalizedPhone}`, session);
+
+      return session;
     } catch (error) {
-      console.error('[WhatsApp Auth] Authentication failed:', error);
+      console.error('[WhatsApp Auth] Authentication error:', error);
       throw new Error('WhatsApp authentication failed');
     }
   }

@@ -4,6 +4,7 @@ import { prisma } from '../database/prisma-client';
 import { WebSocketService } from './websocket';
 import { wsService } from '../ws-singleton';
 import { whatsappAuthService } from './whatsapp-auth';
+import { normalizePhoneNumber } from '../utils';
 import axios from 'axios';
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -63,7 +64,13 @@ export class NLPParser {
       /^(bid|offer|buy|sell)\s+(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(\d+(?:\.\d+)?)$/i,
       
       // "100 wheat dec25 bid 150"
-      /^(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(bid|offer|buy|sell)\s+(\d+(?:\.\d+)?)$/i
+      /^(\d+)\s+([a-z]+)\s+([a-z]{3}\d{2})\s+(bid|offer|buy|sell)\s+(\d+(?:\.\d+)?)$/i,
+      
+      // NEW: Handle spaces in monthyear - "Buy 50 Jan 13 Gold at 500"
+      /^(buy|sell|bid|offer)\s+(\d+)\s+([a-z]{3})\s+(\d{2})\s+([a-z]+)\s+(?:at|for)\s+(\d+(?:\.\d+)?)$/i,
+      
+      // NEW: Alternative order - "buy 100 gold jan 13 at 500"
+      /^(buy|sell|bid|offer)\s+(\d+)\s+([a-z]+)\s+([a-z]{3})\s+(\d{2})\s+(?:at|for)\s+(\d+(?:\.\d+)?)$/i
     ];
 
     for (let i = 0; i < patterns.length; i++) {
@@ -77,6 +84,20 @@ export class NLPParser {
           [, amount, product, monthyear, action, price] = match;
         } else if (i === 1) { // Pattern with product before monthyear
           [, action, amount, product, monthyear, price] = match;
+        } else if (i === 4) { // "Buy 50 Jan 13 Gold at 500" pattern
+          const [, actionMatch, amountMatch, month, year, productMatch, priceMatch] = match;
+          action = actionMatch;
+          amount = amountMatch;
+          product = productMatch;
+          monthyear = month + year; // Combine "jan" + "13" = "jan13"
+          price = priceMatch;
+        } else if (i === 5) { // "buy 100 gold jan 13 at 500" pattern
+          const [, actionMatch, amountMatch, productMatch, month, year, priceMatch] = match;
+          action = actionMatch;
+          amount = amountMatch;
+          product = productMatch;
+          monthyear = month + year; // Combine "jan" + "13" = "jan13"
+          price = priceMatch;
         } else {
           [, action, amount, monthyear, product, price] = match;
         }
@@ -95,10 +116,9 @@ export class NLPParser {
           continue;
         }
 
-        // Validate product (extend this list as needed)
-        const validProducts = ['wheat', 'gold', 'oil', 'silver', 'gas', 'power', 'corn', 'soy'];
-        if (!validProducts.includes(product.toLowerCase())) {
-          console.log('[REGEX] Invalid product:', product);
+        // Validate product (accept any reasonable product name)
+        if (!product || product.length < 2 || !/^[a-z]+$/.test(product.toLowerCase())) {
+          console.log('[REGEX] Invalid product format:', product);
           continue;
         }
 
@@ -144,17 +164,38 @@ export class NLPParser {
     while (attempt < maxRetries) {
       try {
         console.log('[NLP Input]', text);
-        const prompt = `Extract ONLY the following fields as a single-line JSON: action (bid/offer), product, monthyear, price, amount. If the action is "buy", set action to "bid". If the action is "sell", set action to "offer". No explanation, no extra text, no markdown. Message: "${text}"`;
+        const prompt = `You are a trading order parser. Extract EXACTLY these fields as JSON:
+
+REQUIRED FORMAT:
+- action: must be "bid" (for buy/purchase) or "offer" (for sell)  
+- product: any commodity or product name (examples: wheat, gold, oil, silver, coffee, copper, lumber, etc.)
+- monthyear: must be 3-letter month + 2-digit year (examples: "jan25", "dec24", "feb26")
+- price: number only, no currency symbols
+- amount: number only, no commas
+
+EXAMPLES:
+"Buy 100 Dec25 Wheat at 150" → {"action":"bid","product":"wheat","monthyear":"dec25","price":150,"amount":100}
+"Sell 50 gold jan26 for 2000" → {"action":"offer","product":"gold","monthyear":"jan26","price":2000,"amount":50}
+"I want to buy Cup March 25th" → {"action":"bid","product":"cup","monthyear":"mar25","price":1300,"amount":1000}
+
+MONTH CONVERSION:
+january=jan, february=feb, march=mar, april=apr, may=may, june=jun,
+july=jul, august=aug, september=sep, october=oct, november=nov, december=dec
+
+Parse this message: "${text}"
+
+Return ONLY the JSON, no explanation:`;
+
         const response = await axios.post(
           'https://api.openai.com/v1/chat/completions',
           {
             model: 'gpt-3.5-turbo',
             messages: [
-              { role: 'system', content: 'You are a helpful trading assistant.' },
+              { role: 'system', content: 'You are a precise trading order parser. Always return valid JSON matching the exact format specified.' },
               { role: 'user', content: prompt }
             ],
             max_tokens: 150,
-            temperature: 0.2
+            temperature: 0.1 // Lower temperature for more consistent output
           },
           {
             headers: {
@@ -165,6 +206,7 @@ export class NLPParser {
         );
         const content = response.data.choices[0].message.content;
         console.log('[OpenAI Response]', content);
+        
         // Safer JSON extraction
         try {
           const jsonStart = content.indexOf('{');
@@ -173,27 +215,72 @@ export class NLPParser {
           const jsonString = content.slice(jsonStart, jsonEnd);
           const json = JSON.parse(jsonString);
           console.log('[Parsed JSON]', json);
+          
+          // Robust data extraction with type handling
+          const action = String(json.action || '').toLowerCase();
+          const product = String(json.product || '').toLowerCase();
+          const monthyear = String(json.monthyear || '').toLowerCase();
+          const amount = typeof json.amount === 'number' ? json.amount : parseInt(String(json.amount || '0').replace(/[^\d]/g, ''));
+          const price = typeof json.price === 'number' ? json.price : parseFloat(String(json.price || '0').replace(/[^\d.]/g, ''));
+          
           // Action mapping
           const actionMap: Record<string, string> = {
             'buy': 'bid', 'bids': 'bid', 'bidding': 'bid', 'bid': 'bid',
             'sell': 'offer', 'sells': 'offer', 'offering': 'offer', 'offer': 'offer'
           };
-          let action = actionMap[(json.action || '').toLowerCase()] || (json.action || '').toLowerCase();
+          const normalizedAction = actionMap[action] || action;
+          
+          // Enhanced monthyear normalization
+          let normalizedMonthYear = monthyear;
+          
+          // Handle full month names to abbreviations
+          const monthMap: Record<string, string> = {
+            'january': 'jan', 'february': 'feb', 'march': 'mar', 'april': 'apr',
+            'may': 'may', 'june': 'jun', 'july': 'jul', 'august': 'aug',
+            'september': 'sep', 'october': 'oct', 'november': 'nov', 'december': 'dec'
+          };
+          
+          // Convert "december 12th" or "december 12" to "dec12"
+          for (const [fullMonth, abbrev] of Object.entries(monthMap)) {
+            if (monthyear.includes(fullMonth)) {
+              // Extract year from patterns like "december 12th" or "december 12"
+              const yearMatch = monthyear.match(/(\d{1,2})/);
+              if (yearMatch) {
+                const year = yearMatch[1].padStart(2, '0'); // Ensure 2 digits
+                normalizedMonthYear = abbrev + year;
+                break;
+              }
+            }
+          }
+          
           // Validation helpers
-          const isValidMonthYear = (str: string) => /^[A-Za-z]{3}\d{2}$/.test(str);
-          const isValidProduct = (product: string) => ['wheat', 'gold', 'oil', 'silver'].includes((product || '').toLowerCase());
-          const amount = parseInt(json.amount?.replace(/,/g, '') || '0');
-          const price = parseFloat(json.price?.replace(/,/g, '') || '0');
-          const validAction = ['bid', 'offer'].includes(action);
-          const validProduct = isValidProduct(json.product);
-          const validMonthYear = isValidMonthYear(json.monthyear);
-          console.log('[Validation]', { validAction, validProduct, validMonthYear });
-          if (!validAction || !validProduct || !validMonthYear || isNaN(amount) || isNaN(price)) return null;
+          const isValidMonthYear = (str: string) => /^[a-z]{3}\d{2}$/.test(str);
+          const isValidProduct = (product: string) => product && product.length >= 2 && /^[a-z]+$/.test(product);
+          const validAction = ['bid', 'offer'].includes(normalizedAction);
+          const validProduct = isValidProduct(product);
+          const validMonthYear = isValidMonthYear(normalizedMonthYear);
+          
+          console.log('[Validation]', { 
+            action: normalizedAction, 
+            validAction, 
+            product, 
+            validProduct, 
+            monthyear: normalizedMonthYear, 
+            validMonthYear,
+            amount,
+            price
+          });
+          
+          if (!validAction || !validProduct || !validMonthYear || isNaN(amount) || isNaN(price) || amount <= 0 || price <= 0) {
+            console.log('[AI Parse] Validation failed');
+            return null;
+          }
+          
           return {
-            action,
+            action: normalizedAction as 'bid' | 'offer',
             price,
-            monthyear: json.monthyear.toLowerCase(),
-            product: json.product.toLowerCase(),
+            monthyear: normalizedMonthYear,
+            product,
             amount,
             confidence: 0.99,
             rawText: text
@@ -230,7 +317,7 @@ export class NLPParser {
 export async function processNLPCommand(message: string, from: string): Promise<{ success: boolean; response: string; error?: string }> {
   try {
     const cleanMessage = message.trim().toLowerCase();
-    const phoneNumber = from.replace('whatsapp:', '');
+    const phoneNumber = normalizePhoneNumber(from);
     
     console.log('[NLP] Processing command from:', phoneNumber, '- Message:', message);
     
@@ -257,13 +344,13 @@ export async function processNLPCommand(message: string, from: string): Promise<
       return {
         success: true,
         response: `${helpText}
-• "Buy 100 Dec25 Wheat at 150" - Place buy order
-• "Sell 50 Jan26 Gold for 2000" - Place sell order
-• "Market" - View market data
-• "Orders" - View your orders
-• "Trades" - View recent trades
-• "Cancel [order_id]" - Cancel order
-• "Help" - Show this message
+          • "Buy 100 Dec25 Wheat at 150" - Place buy order
+          • "Sell 50 Jan26 Gold for 2000" - Place sell order
+          • "Market" - View market data
+          • "Orders" - View your orders
+          • "Trades" - View recent trades
+          • "Cancel [order_id]" - Cancel order
+          • "Help" - Show this message
 
 ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our website for full features!' : ''}`
       };
@@ -279,9 +366,15 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
         };
       }
 
-      const marketText = marketData.slice(0, 5).map(item => 
-        `${item.asset}: Bid ${item.bid_price || 'N/A'} | Offer ${item.offer_price || 'N/A'}`
-      ).join('\n');
+      const marketText = marketData.slice(0, 5).map(item => {
+        // Extract best bid (highest price) and best offer (lowest price)
+        const bestBid = item.bids && item.bids.length > 0 ? item.bids[0].price : null;
+        const bestOffer = item.offers && item.offers.length > 0 ? item.offers[0].price : null;
+        const bidVolume = item.bids && item.bids.length > 0 ? item.bids[0].remaining : 0;
+        const offerVolume = item.offers && item.offers.length > 0 ? item.offers[0].remaining : 0;
+        
+        return `${item.asset}: Bid ${bestBid ? `$${bestBid} (${bidVolume}x)` : 'N/A'} | Offer ${bestOffer ? `$${bestOffer} (${offerVolume}x)` : 'N/A'}`;
+      }).join('\n');
 
       return {
         success: true,
@@ -373,10 +466,10 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
       return {
         success: true,
         response: `📈 Account Summary for ${session.username}:
-Total Orders: ${summary.total_orders}
-Active Orders: ${summary.active_orders}
-Total Trades: ${summary.total_trades}
-Total Volume: ${summary.total_volume}
+  Total Orders: ${summary.total_orders}
+  Active Orders: ${summary.active_orders}
+  Total Trades: ${summary.total_trades}
+  Total Volume: ${summary.total_volume}
 
 ${!session.isRegistered ? '💡 Guest account - Register for full features!' : ''}`
       };
@@ -397,34 +490,80 @@ ${!session.isRegistered ? '💡 Guest account - Register for full features!' : '
     if (parsedOrder) {
       console.log('[NLP] Order parsed successfully:', parsedOrder);
       
-      const result = await orderBookService.createOrder(
-        session.userId,
-        parsedOrder.action.toUpperCase() as 'BID' | 'OFFER',
-        parsedOrder.price,
-        parsedOrder.monthyear,
-        parsedOrder.product,
-        parsedOrder.amount
-      );
+      try {
+        // Verify user exists before creating order
+        const userCheck = await prisma.user.findUnique({
+          where: { id: session.userId },
+          select: { id: true, username: true, isActive: true }
+        });
+        
+        if (!userCheck) {
+          console.error('[NLP] User not found in database:', session.userId);
+          return {
+            success: false,
+            response: '',
+            error: 'User authentication error. Please try again.'
+          };
+        }
+        
+        if (!userCheck.isActive) {
+          console.error('[NLP] User is inactive:', session.userId);
+          return {
+            success: false,
+            response: '',
+            error: 'Your account is currently inactive.'
+          };
+        }
+        
+        console.log('[NLP] User verified in database:', userCheck.username);
+        
+        const result = await orderBookService.createOrder(
+          session.userId,
+          parsedOrder.action.toUpperCase() as 'BID' | 'OFFER',
+          parsedOrder.price,
+          parsedOrder.monthyear,
+          parsedOrder.product,
+          parsedOrder.amount
+        );
 
-      if (result.errors.length > 0) {
+        if (result.errors.length > 0) {
+          console.error('[NLP] Order creation errors:', result.errors);
+          return {
+            success: false,
+            response: '',
+            error: result.errors.join(', ')
+          };
+        }
+
+        const method = parsedOrder.confidence >= 0.9 ? 'Regex' : 'AI';
+        const userType = session.isRegistered ? session.username : 'Guest';
+        
         return {
-          success: false,
-          response: '',
-          error: result.errors.join(', ')
-        };
-      }
-
-      const method = parsedOrder.confidence >= 0.9 ? 'Regex' : 'AI';
-      const userType = session.isRegistered ? session.username : 'Guest';
-      
-      return {
-        success: true,
-        response: `✅ Order created (${method}) for ${userType}:
+          success: true,
+          response: `✅ Order created (${method}) for ${userType}:
 ${parsedOrder.action.toUpperCase()} ${parsedOrder.amount} ${parsedOrder.product} ${parsedOrder.monthyear} @ $${parsedOrder.price}
 Order ID: ${result.order.id.slice(0, 8)}
 
 ${!session.isRegistered ? '💡 Register at our website to upgrade from guest account!' : ''}`
-      };
+        };
+      } catch (error: any) {
+        console.error('[NLP] Order creation failed:', error);
+        
+        // Specific error handling for database issues
+        if (error.code === 'P2003') {
+          return {
+            success: false,
+            response: '',
+            error: 'Database error: User reference invalid. Please try logging out and back in.'
+          };
+        }
+        
+        return {
+          success: false,
+          response: '',
+          error: 'Failed to create order. Please try again.'
+        };
+      }
     }
 
     // If both regex and AI parsing fail
