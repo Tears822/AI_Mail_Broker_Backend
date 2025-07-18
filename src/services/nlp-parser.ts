@@ -4,6 +4,7 @@ import { prisma } from '../database/prisma-client';
 import { WebSocketService } from './websocket';
 import { wsService } from '../ws-singleton';
 import { whatsappAuthService } from './whatsapp-auth';
+import { sendWhatsAppMessage } from './whatsapp';
 import { normalizePhoneNumber } from '../utils';
 import axios from 'axios';
 import { config as dotenvConfig } from 'dotenv';
@@ -344,15 +345,35 @@ export async function processNLPCommand(message: string, from: string): Promise<
       return {
         success: true,
         response: `${helpText}
-          • "Buy 100 Dec25 Wheat at 150" - Place buy order
-          • "Sell 50 Jan26 Gold for 2000" - Place sell order
-          • "Market" - View market data
-          • "Orders" - View your orders
-          • "Trades" - View recent trades
-          • "Cancel [order_id]" - Cancel order
-          • "Help" - Show this message
 
-${!session.isRegistered ? '\n💡 You are using a guest account. Register at our website for full features!' : ''}`
+💼 TRADING:
+• "Buy 100 Dec25 Wheat at 150" - Place buy order
+• "Sell 50 Jan26 Gold for 2000" - Place sell order
+
+📊 MARKET DATA:
+• "Market" - View market data
+• "Orders" - View your orders (with IDs)
+• "Trades" - View recent market trades
+• "My Trades" - View your trading history
+
+🔧 ORDER MANAGEMENT:
+• "Cancel 12345678" - Cancel order by ID
+• "Edit 12345678 price 175" - Update order price
+• "Update 12345678 amount 200" - Update order amount
+• "Modify 12345678 price 180 amount 150" - Update both
+• "Edit last order price 175" - Update your latest order
+• "Status 12345678" - Check order details
+• "Last order" - View your latest order
+
+ℹ️ OTHER:
+• "Help" - Show this message
+
+${!session.isRegistered ? '\n💡 You are using a guest account. Register at our website for full features!' : ''}
+
+💡 Tips:
+• Use "Orders" to see your order IDs for editing/canceling
+• "Last order" gives you quick access to your most recent order
+• You can use partial order IDs (first 8 characters)`
       };
     }
 
@@ -388,38 +409,75 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
       if (orders.length === 0) {
         return {
           success: true,
-          response: '📋 You have no orders.'
+          response: '📋 You have no active orders.'
         };
       }
 
-      const ordersText = orders.slice(0, 5).map(order => 
-        `${order.id.slice(0, 8)}: ${order.action} ${order.amount} ${order.asset} @ ${order.price} (${order.status})`
-      ).join('\n');
+      const ordersText = orders.slice(0, 8).map(order => {
+        const shortId = order.id.slice(0, 8);
+        const action = order.action.toLowerCase();
+        const actionIcon = action === 'bid' ? '🟢' : '🟠';
+        const actionText = action === 'bid' ? 'BUY' : 'SELL';
+        
+        return `${actionIcon} ID: ${shortId}
+${actionText} ${order.remaining}/${order.amount} ${order.asset} @ $${order.price}
+Status: ${order.status}`;
+      }).join('\n\n');
+
+      const managementTip = orders.length > 0 ? 
+        `\n\n🔧 Management:\n• Cancel: "Cancel ${orders[0].id.slice(0, 8)}"\n• Edit: "Edit ${orders[0].id.slice(0, 8)} price 150"` : '';
 
       return {
         success: true,
-        response: `📋 Your Orders:\n${ordersText}`
+        response: `📋 Your Active Orders:\n\n${ordersText}${managementTip}`
       };
     }
 
     // Handle trades request
     if (cleanMessage.includes('trades') || cleanMessage.includes('recent')) {
-      const trades = await orderBookService.getRecentTrades(5);
-      if (trades.length === 0) {
+      // Check if user wants their own trades specifically
+      if (cleanMessage.includes('my trades') || cleanMessage.includes('my recent')) {
+        const userTrades = await orderBookService.getUserTrades(session.userId, 5);
+        if (userTrades.length === 0) {
+          return {
+            success: true,
+            response: '💱 You have no completed trades yet.'
+          };
+        }
+
+        const tradesText = userTrades.map(trade => {
+          const isUserBuyer = trade.buyerId === session.userId;
+          const role = isUserBuyer ? 'BOUGHT' : 'SOLD';
+          const counterparty = isUserBuyer ? 
+            (trade.seller?.username || trade.sellerId) : 
+            (trade.buyer?.username || trade.buyerId);
+          
+          return `${role}: ${trade.amount} ${trade.asset} @ $${trade.price} (${counterparty})`;
+        }).join('\n');
+
         return {
           success: true,
-          response: '💱 No recent trades.'
+          response: `💱 Your Recent Trades:\n${tradesText}`
+        };
+      } else {
+        // Show general market trades
+        const trades = await orderBookService.getRecentTrades(5);
+        if (trades.length === 0) {
+          return {
+            success: true,
+            response: '💱 No recent trades.'
+          };
+        }
+
+        const tradesText = trades.map(trade => 
+          `${trade.asset}: ${trade.amount} @ ${trade.price}`
+        ).join('\n');
+
+        return {
+          success: true,
+          response: `💱 Recent Market Trades:\n${tradesText}`
         };
       }
-
-      const tradesText = trades.map(trade => 
-        `${trade.asset}: ${trade.amount} @ ${trade.price}`
-      ).join('\n');
-
-      return {
-        success: true,
-        response: `💱 Recent Trades:\n${tradesText}`
-      };
     }
 
     // Handle quantity confirmation responses from WhatsApp
@@ -430,34 +488,210 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
         const [, response, orderIdPart] = confirmationMatch;
         const accepted = response.toLowerCase() === 'yes';
         
-        // Find the confirmation key by searching for pending confirmations with this order ID part
-        // This is a simplified approach - in production you might want to store confirmations differently
-        console.log(`[NLP] WhatsApp quantity confirmation: ${response} for order ${orderIdPart}`);
+        console.log(`[NLP] WhatsApp quantity confirmation: ${response} for order ${orderIdPart} from user ${session.userId}`);
         
-        return {
-          success: true,
-          response: `✅ Confirmation received: ${response.toUpperCase()}. Processing your response...`
-        };
+        // Get the matching engine instance from wsService
+        const matchingEngine = wsService.getMatchingEngine();
+        if (!matchingEngine) {
+          console.error('[NLP] Matching engine not available');
+          return {
+            success: false,
+            response: '',
+            error: 'Trading system temporarily unavailable. Please try again.'
+          };
+        }
+        
+        // Find the confirmation key by order ID part
+        const confirmationKey = matchingEngine.getPendingConfirmationByOrderId(orderIdPart);
+        if (!confirmationKey) {
+          return {
+            success: false,
+            response: '',
+            error: 'No pending confirmation found for that order. The confirmation may have expired.'
+          };
+        }
+        
+        // Get confirmation details to determine new quantity
+        const userConfirmations = matchingEngine.getUserPendingConfirmations(session.userId);
+        const userConfirmation = userConfirmations.find((c: {confirmationKey: string; details: any}) => c.confirmationKey === confirmationKey);
+        
+        if (!userConfirmation) {
+          return {
+            success: false,
+            response: '',
+            error: 'Invalid confirmation - this request was not sent to you.'
+          };
+        }
+        
+        let newQuantity: number | undefined;
+        if (accepted) {
+          // User wants to increase to the larger quantity
+          newQuantity = userConfirmation.details.availableQuantity;
+        }
+        
+        // Call the matching engine to handle the response
+        await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted, newQuantity);
+        
+        if (accepted) {
+          return {
+            success: true,
+            response: `✅ Confirmation ACCEPTED! 
+
+You've agreed to trade ${userConfirmation.details.availableQuantity} lots of ${userConfirmation.details.asset} instead of ${userConfirmation.details.yourQuantity} lots.
+
+Your order is being updated and the trade will execute automatically.`
+          };
+        } else {
+          return {
+            success: true,
+            response: `✅ Confirmation received: NO
+
+You've chosen to proceed with your original ${userConfirmation.details.yourQuantity} lots order. The trade will execute for the smaller quantity.`
+          };
+        }
       }
     }
 
-    // Handle order cancellation
-    if (cleanMessage.includes('cancel')) {
-      const orderIdMatch = cleanMessage.match(/cancel\s+(\w+)/i);
+    // Handle order cancellation - Enhanced
+    if (cleanMessage.includes('cancel') || cleanMessage.includes('delete')) {
+      const orderIdMatch = cleanMessage.match(/(?:cancel|delete)\s+([a-f0-9-]{8,})/i);
       if (!orderIdMatch) {
         return {
           success: false,
           response: '',
-          error: 'Please specify order ID: "Cancel [order_id]"'
+          error: 'Please specify order ID. Example: "Cancel 12345678" or get your order IDs with "Orders"'
         };
       }
 
       const orderId = orderIdMatch[1];
-      const result = await orderBookService.cancelOrder(session.userId, orderId);
-      return {
-        success: result.success,
-        response: result.message
-      };
+      console.log(`[NLP] Attempting to cancel order: ${orderId} for user: ${session.userId}`);
+      
+      try {
+        const result = await orderBookService.cancelOrder(session.userId, orderId);
+        return {
+          success: result.success,
+          response: result.success ? `✅ ${result.message}` : '',
+          error: result.success ? undefined : result.message
+        };
+      } catch (error) {
+        console.error('[NLP] Error canceling order:', error);
+        return {
+          success: false,
+          response: '',
+          error: 'Failed to cancel order. Please try again.'
+        };
+      }
+    }
+
+    // Handle order editing - Enhanced with "last order" support
+    if (cleanMessage.includes('edit') || cleanMessage.includes('update') || cleanMessage.includes('modify')) {
+      let orderId = '';
+      
+      // Check if user wants to edit their last order
+      if ((cleanMessage.includes('last') || cleanMessage.includes('latest')) && cleanMessage.includes('order')) {
+        try {
+          const orders = await orderBookService.getUserOrders(session.userId);
+          if (orders.length === 0) {
+            return {
+              success: false,
+              response: '',
+              error: 'You have no active orders to edit.'
+            };
+          }
+          orderId = orders[0].id; // Most recent order
+          console.log(`[NLP] Using last order ID: ${orderId.slice(0, 8)}`);
+        } catch (error) {
+          return {
+            success: false,
+            response: '',
+            error: 'Failed to retrieve your orders.'
+          };
+        }
+      } else {
+        // Standard order ID matching
+        const orderIdMatch = cleanMessage.match(/(?:edit|update|modify)(?:\s+order)?\s+([a-f0-9-]{8,})/i);
+        if (!orderIdMatch) {
+          return {
+            success: false,
+            response: '',
+            error: 'Please specify order ID or use "last order". Examples:\n• "Edit 12345678 price 150"\n• "Edit last order price 175"\n• "Update last order amount 100"'
+          };
+        }
+        orderId = orderIdMatch[1];
+      }
+      
+      // Extract price and/or amount updates
+      const priceMatch = cleanMessage.match(/price\s+(\d+(?:\.\d+)?)/i);
+      const amountMatch = cleanMessage.match(/(?:amount|quantity|qty)\s+(\d+)/i);
+      
+      if (!priceMatch && !amountMatch) {
+        return {
+          success: false,
+          response: '',
+          error: 'Please specify what to update. Examples:\n• "Edit 12345678 price 150"\n• "Update last order amount 100"\n• "Modify 12345678 price 150 amount 200"'
+        };
+      }
+
+      const updates: any = {};
+      if (priceMatch) {
+        const newPrice = parseFloat(priceMatch[1]);
+        if (newPrice <= 0) {
+          return {
+            success: false,
+            response: '',
+            error: 'Price must be greater than 0'
+          };
+        }
+        updates.price = newPrice;
+      }
+      
+      if (amountMatch) {
+        const newAmount = parseInt(amountMatch[1]);
+        if (newAmount <= 0) {
+          return {
+            success: false,
+            response: '',
+            error: 'Amount must be greater than 0'
+          };
+        }
+        updates.amount = newAmount;
+      }
+
+      console.log(`[NLP] Attempting to update order: ${orderId.slice(0, 8)} with:`, updates);
+      
+      try {
+        const result = await orderBookService.updateOrder(session.userId, orderId, updates);
+        
+        if (result.success) {
+          const updateSummary = [];
+          if (updates.price) updateSummary.push(`Price: $${updates.price}`);
+          if (updates.amount) updateSummary.push(`Amount: ${updates.amount} lots`);
+          
+          return {
+            success: true,
+            response: `✅ Order Updated Successfully!
+
+Order ID: ${orderId.slice(0, 8)}
+Updated: ${updateSummary.join(', ')}
+Asset: ${result.order.asset}
+
+Your order is now active with the new values.`
+          };
+        } else {
+          return {
+            success: false,
+            response: '',
+            error: result.message
+          };
+        }
+      } catch (error) {
+        console.error('[NLP] Error updating order:', error);
+        return {
+          success: false,
+          response: '',
+          error: 'Failed to update order. Please check the order ID and try again.'
+        };
+      }
     }
 
     // Handle account/balance request
@@ -466,13 +700,114 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
       return {
         success: true,
         response: `📈 Account Summary for ${session.username}:
-  Total Orders: ${summary.total_orders}
-  Active Orders: ${summary.active_orders}
-  Total Trades: ${summary.total_trades}
-  Total Volume: ${summary.total_volume}
+Total Orders: ${summary.total_orders}
+Active Orders: ${summary.active_orders}
+Total Trades: ${summary.total_trades}
+Total Volume: ${summary.total_volume}
 
 ${!session.isRegistered ? '💡 Guest account - Register for full features!' : ''}`
       };
+    }
+
+    // Handle order status check - NEW
+    if (cleanMessage.includes('status') && (cleanMessage.includes('order') || /[a-f0-9-]{8,}/.test(cleanMessage))) {
+      const orderIdMatch = cleanMessage.match(/(?:status|check)(?:\s+order)?\s+([a-f0-9-]{8,})/i) || 
+                           cleanMessage.match(/([a-f0-9-]{8,})\s+status/i);
+      
+      if (!orderIdMatch) {
+        return {
+          success: false,
+          response: '',
+          error: 'Please specify order ID. Example: "Status 12345678" or "Check order 12345678"'
+        };
+      }
+
+      const orderId = orderIdMatch[1];
+      try {
+        // Get user's orders and find the specified one
+        const orders = await orderBookService.getUserOrders(session.userId);
+        const order = orders.find(o => o.id.startsWith(orderId) || o.id === orderId);
+        
+        if (!order) {
+          return {
+            success: false,
+            response: '',
+            error: `Order ${orderId} not found in your active orders. Use "Orders" to see your current orders.`
+          };
+        }
+
+        const actionIcon = order.action.toLowerCase() === 'bid' ? '🟢' : '🟠';
+        const actionText = order.action.toLowerCase() === 'bid' ? 'BUY' : 'SELL';
+        
+        return {
+          success: true,
+          response: `📊 Order Status:
+
+${actionIcon} ${actionText} Order
+ID: ${order.id.slice(0, 8)}
+Asset: ${order.asset}
+Price: $${order.price}
+Amount: ${order.amount} lots
+Remaining: ${order.remaining} lots
+Status: ${order.status}
+Created: ${new Date(order.createdAt).toLocaleString()}
+
+🔧 Quick Actions:
+• Cancel: "Cancel ${order.id.slice(0, 8)}"
+• Edit Price: "Edit ${order.id.slice(0, 8)} price [new_price]"
+• Edit Amount: "Edit ${order.id.slice(0, 8)} amount [new_amount]"`
+        };
+      } catch (error) {
+        console.error('[NLP] Error checking order status:', error);
+        return {
+          success: false,
+          response: '',
+          error: 'Failed to check order status. Please try again.'
+        };
+      }
+    }
+
+    // Handle "last order" or "latest order" shortcuts - NEW
+    if ((cleanMessage.includes('last') || cleanMessage.includes('latest') || cleanMessage.includes('recent')) && 
+        cleanMessage.includes('order') && !cleanMessage.includes('trades')) {
+      try {
+        const orders = await orderBookService.getUserOrders(session.userId);
+        if (orders.length === 0) {
+          return {
+            success: true,
+            response: '📋 You have no active orders.'
+          };
+        }
+
+        // Get the most recent order (first in the list since they're sorted by createdAt desc)
+        const lastOrder = orders[0];
+        const actionIcon = lastOrder.action.toLowerCase() === 'bid' ? '🟢' : '🟠';
+        const actionText = lastOrder.action.toLowerCase() === 'bid' ? 'BUY' : 'SELL';
+        
+        return {
+          success: true,
+          response: `📊 Your Latest Order:
+
+${actionIcon} ${actionText} Order
+ID: ${lastOrder.id.slice(0, 8)}
+Asset: ${lastOrder.asset}
+Price: $${lastOrder.price}
+Amount: ${lastOrder.amount} lots
+Remaining: ${lastOrder.remaining} lots
+Status: ${lastOrder.status}
+
+🔧 Quick Actions:
+• Cancel: "Cancel ${lastOrder.id.slice(0, 8)}"
+• Edit Price: "Edit ${lastOrder.id.slice(0, 8)} price [new_price]"`
+        };
+      } catch (error) {
+        console.error('[NLP] Error getting last order:', error);
+        return {
+          success: false,
+          response: '',
+          error: 'Failed to retrieve your latest order.'
+        };
+      }
     }
 
     // Check if user can trade

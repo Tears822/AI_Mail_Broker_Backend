@@ -44,7 +44,7 @@ export const requireAdmin = (req: AuthenticatedRequest, res: Response, next: Nex
     return res.status(401).json({ detail: 'Authentication required' });
   }
 
-  if (req.user.role !== 'admin') {
+  if (req.user.role !== 'ADMIN') {
     return res.status(403).json({ detail: 'Admin access required' });
   }
 

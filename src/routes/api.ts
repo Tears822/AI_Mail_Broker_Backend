@@ -302,6 +302,19 @@ router.get('/trades', async (req, res) => {
   }
 });
 
+// Get user-specific trades
+router.get('/my-trades', async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user?.userId || '';
+    const limit = parseInt(req.query.limit as string) || 50;
+    const trades = await orderBookService.getUserTrades(userId, limit);
+    res.json({ trades });
+  } catch (error) {
+    console.error('User trades error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Account summary
 router.get('/account', async (req: AuthenticatedRequest, res) => {
   try {

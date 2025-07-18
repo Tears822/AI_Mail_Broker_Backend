@@ -11,10 +11,19 @@ import { sendWhatsAppMessage } from './whatsapp';
  */
 export class OrderBookService {
   private wsService?: WebSocketService;
+  private matchingEngine?: any; // Reference to matching engine for immediate triggers
+
   constructor(wsService?: WebSocketService) {
     this.wsService = wsService;
   }
-  setWebSocketService(wsService: WebSocketService) {
+
+  // Method to set matching engine reference for immediate triggers
+  public setMatchingEngine(matchingEngine: any) {
+    this.matchingEngine = matchingEngine;
+  }
+
+  // Method to set WebSocket service (for external injection)
+  public setWebSocketService(wsService: WebSocketService) {
     this.wsService = wsService;
   }
 
@@ -126,11 +135,148 @@ Your order is now active in the market.`;
       // Update order book in Redis
       await this.updateOrderBookInRedis(asset);
 
+      // 🔥 NEW: Send competitive bidding alerts after order creation
+      await this.checkAndSendCompetitiveBiddingAlerts(asset, order);
+
+      // Trigger matching engine for immediate processing
+      if (this.matchingEngine) {
+        this.matchingEngine.processAsset(asset);
+        console.log(`[MATCHING_ENGINE] Triggered matching engine for asset: ${asset}`);
+      } else {
+        console.warn(`[MATCHING_ENGINE] Matching engine not initialized. Cannot trigger immediate matching for asset: ${asset}`);
+      }
+
       return { order, errors: [] };
     } catch (error) {
       console.error('Error creating order:', error);
-      errors.push('Failed to create order');
-      return { order: null, errors };
+      return { order: null, errors: ['Failed to create order'] };
+    }
+  }
+
+  // 🔥 NEW: Check for competitive bidding opportunities and send alerts
+  private async checkAndSendCompetitiveBiddingAlerts(asset: string, newOrder: any): Promise<void> {
+    try {
+      // Get all active orders for this asset
+      const orders = await prisma.order.findMany({
+        where: {
+          asset,
+          status: 'ACTIVE',
+          remaining: { gt: 0 }
+        },
+        orderBy: [
+          { price: 'desc' },
+          { createdAt: 'asc' }
+        ]
+      });
+
+      const bids = orders.filter(o => o.action === 'BID');
+      const offers = orders.filter(o => o.action === 'OFFER');
+
+      if (bids.length === 0 || offers.length === 0) {
+        return; // Need both bids and offers for competition
+      }
+
+      // Find best bid and best offer
+      const bestBid = bids.reduce((a, b) => Number(a.price) > Number(b.price) ? a : b);
+      const bestOffer = offers.reduce((a, b) => Number(a.price) < Number(b.price) ? a : b);
+
+      const bidPrice = Number(bestBid.price);
+      const offerPrice = Number(bestOffer.price);
+
+      // Only send alerts if prices don't match but are close
+      if (bidPrice >= offerPrice) {
+        return; // Prices match or cross - will be handled by matching engine
+      }
+
+      const spread = offerPrice - bidPrice;
+      const spreadPercentage = (spread / bidPrice) * 100;
+
+      // Only send alerts if spread is reasonable (less than 20%)
+      if (spreadPercentage > 20) {
+        return;
+      }
+
+      console.log(`[COMPETITIVE] New order placed for ${asset}: checking competitive alerts`);
+
+      // If the new order is a bid, alert about available offers
+      if (newOrder.action === 'BID' && newOrder.id === bestBid.id) {
+        const message = `💰 COMPETITIVE OPPORTUNITY!
+
+${asset.toUpperCase()}
+Your NEW BID: ${newOrder.remaining} lots @ $${newOrder.price}
+Available OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 You could trade immediately by improving your bid to $${offerPrice}!
+Your Order ID: ${newOrder.id.slice(0, 8)}
+
+Use: "Edit ${newOrder.id.slice(0, 8)} price ${offerPrice}" to match the offer.`;
+
+        await this.sendWhatsAppToUser(newOrder.userId, message);
+
+        // Also notify the offer holder about the new competing bid
+        const offerHolderMessage = `💰 NEW COMPETITIVE BID!
+
+${asset.toUpperCase()}
+Your OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
+NEW BID: ${newOrder.remaining} lots @ $${newOrder.price}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 Consider lowering your offer to $${newOrder.price} to trade immediately!
+Your Order ID: ${bestOffer.id.slice(0, 8)}`;
+
+        await this.sendWhatsAppToUser(bestOffer.userId, offerHolderMessage);
+      }
+
+      // If the new order is an offer, alert about available bids
+      if (newOrder.action === 'OFFER' && newOrder.id === bestOffer.id) {
+        const message = `💰 COMPETITIVE OPPORTUNITY!
+
+${asset.toUpperCase()}
+Your NEW OFFER: ${newOrder.remaining} lots @ $${newOrder.price}
+Available BID: ${bestBid.remaining} lots @ $${bidPrice}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 You could trade immediately by lowering your offer to $${bidPrice}!
+Your Order ID: ${newOrder.id.slice(0, 8)}
+
+Use: "Edit ${newOrder.id.slice(0, 8)} price ${bidPrice}" to match the bid.`;
+
+        await this.sendWhatsAppToUser(newOrder.userId, message);
+
+        // Also notify the bid holder about the new competing offer
+        const bidHolderMessage = `💰 NEW COMPETITIVE OFFER!
+
+${asset.toUpperCase()}
+Your BID: ${bestBid.remaining} lots @ $${bidPrice}
+NEW OFFER: ${newOrder.remaining} lots @ $${newOrder.price}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 Consider improving your bid to $${newOrder.price} to trade immediately!
+Your Order ID: ${bestBid.id.slice(0, 8)}`;
+
+        await this.sendWhatsAppToUser(bestBid.userId, bidHolderMessage);
+      }
+
+    } catch (error) {
+      console.error('[COMPETITIVE] Error checking competitive bidding alerts:', error);
+    }
+  }
+
+  // Helper method to send WhatsApp message to a specific user
+  private async sendWhatsAppToUser(userId: string, message: string): Promise<void> {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { phone: true, username: true }
+      });
+      
+      if (user?.phone) {
+        await sendWhatsAppMessage(user.phone, message);
+        console.log(`📱 Competitive bidding alert sent to ${user.username}`);
+      }
+    } catch (error) {
+      console.error('Error sending WhatsApp to user:', error);
     }
   }
 
@@ -289,6 +435,12 @@ Your order is now active in the market.`;
       }
       // --- End broadcast logic ---
 
+      // Trigger immediate matching after order update
+      if (this.matchingEngine) {
+        this.matchingEngine.processAsset(updatedOrder.asset);
+        console.log(`[MATCHING_ENGINE] Triggered matching engine after order update for asset: ${updatedOrder.asset}`);
+      }
+
       return { success: true, message: `Order ${orderId} updated successfully`, order: updatedOrder };
     } catch (error) {
       console.error('Error updating order:', error);
@@ -388,6 +540,31 @@ Your order is now active in the market.`;
       return result;
     } catch (error) {
       console.error('Error fetching market data:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get user-specific trades (both as buyer and seller)
+   */
+  async getUserTrades(userId: string, limit: number = 50): Promise<any[]> {
+    try {
+      return await prisma.trade.findMany({
+        where: {
+          OR: [
+            { buyerId: userId },
+            { sellerId: userId }
+          ]
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        include: {
+          buyer: { select: { username: true } },
+          seller: { select: { username: true } }
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching user trades:', error);
       return [];
     }
   }

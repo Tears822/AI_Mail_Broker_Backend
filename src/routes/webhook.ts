@@ -25,7 +25,7 @@ router.post('/whatsapp', async (req, res) => {
     
     console.log(`[Webhook] Response processed for ${phoneNumber}: ${response}`);
     return res.status(200).json({ 
-      success: true, 
+      success: true,
       response: response 
     });
 

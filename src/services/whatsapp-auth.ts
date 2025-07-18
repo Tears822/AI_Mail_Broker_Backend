@@ -52,7 +52,7 @@ export class WhatsAppAuthService {
         // Determine if this is a registered user or WhatsApp-created guest
         const isRegistered = !user.username.startsWith('WhatsApp_') && 
                            !user.email.includes('@whatsapp.temp');
-
+        
         return {
           id: user.id,
           username: user.username,
@@ -93,7 +93,7 @@ export class WhatsAppAuthService {
       });
 
       console.log('[WhatsApp Auth] Created WhatsApp guest user:', finalUsername);
-
+      
       return {
         id: newUser.id,
         username: newUser.username,
@@ -179,7 +179,7 @@ export class WhatsAppAuthService {
     try {
       const normalizedPhone = normalizePhoneNumber(phoneNumber);
       console.log('[WhatsApp Auth] Authenticating user:', normalizedPhone);
-
+      
       // Check if we have a cached session
       const existingSession = this.activeSessions.get(normalizedPhone);
       if (existingSession && new Date(existingSession.expiresAt) > new Date()) {

@@ -36,7 +36,8 @@ async function startServer() {
     console.log('🔗 Initializing matching engine...');
     const matchingEngine = new MatchingEngine(wsService);
     wsService.setMatchingEngine(matchingEngine); // Set the reference
-    matchingEngine.start(); // ENABLED matching engine
+    orderBookService.setMatchingEngine(matchingEngine); // Inject matching engine for immediate triggers
+    matchingEngine.start();
     // console.log('⚠️  Matching engine disabled - working on database connection optimization');
 
     // Start server

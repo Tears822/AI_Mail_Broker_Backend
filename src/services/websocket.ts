@@ -59,6 +59,11 @@ export class WebSocketService {
     this.matchingEngine = matchingEngine;
   }
 
+  // Get the matching engine instance
+  public getMatchingEngine() {
+    return this.matchingEngine;
+  }
+
   private setupMiddleware() {
     // Authentication middleware
     this.io.use(async (socket, next) => {

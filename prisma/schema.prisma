@@ -79,6 +79,11 @@ model Trade {
   buyer       User  @relation("BuyerTrades", fields: [buyerId], references: [id])
   seller      User  @relation("SellerTrades", fields: [sellerId], references: [id])
 
+  // Indexes for better performance
+  @@index([buyerId, createdAt])
+  @@index([sellerId, createdAt])
+  @@index([asset, createdAt])
+  @@index([createdAt])
   @@map("trades")
 }
 

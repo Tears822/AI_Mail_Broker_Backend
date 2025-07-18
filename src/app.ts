@@ -6,6 +6,7 @@ import { apiRateLimit, authRateLimit, orderRateLimit, webhookRateLimit, checkSus
 import authRoutes from './routes/auth';
 import apiRoutes from './routes/api';
 import webhookRoutes from './routes/webhook';
+import adminRoutes from './routes/admin';
 
 const app = express();
 
@@ -63,6 +64,7 @@ app.use(trackFailedAuth);
 // Rate limiting
 app.use('/api/auth', authRateLimit);
 app.use('/api/orders', orderRateLimit);
+app.use('/api/admin', apiRateLimit); // Admin routes get API rate limiting
 app.use('/webhook', webhookRateLimit);
 app.use('/api', apiRateLimit);
 
@@ -78,6 +80,7 @@ app.get('/health', (req, res) => {
 
 // Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
 app.use('/api', apiRoutes);
 app.use('/webhook', webhookRoutes);
 

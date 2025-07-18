@@ -10,7 +10,7 @@ export class MatchingEngine {
   private wsService: WebSocketService;
   private isRunning: boolean = false;
   private matchingInterval: NodeJS.Timeout | null = null;
-  private processingInterval: number = 60000; // 60 seconds - increased from 30 seconds
+  private processingInterval: number = 5000; // 5 seconds - much faster for real-time experience
   private pendingPartialFills: Map<string, NodeJS.Timeout> = new Map();
   // Negotiation state per asset
   private negotiationState: Map<string, {
@@ -19,6 +19,25 @@ export class MatchingEngine {
     turn: 'BID' | 'OFFER';
     timeout: NodeJS.Timeout | null;
   }> = new Map();
+  
+  // Quantity confirmation state
+  private pendingConfirmations: Map<string, {
+    confirmationKey: string;
+    asset: string;
+    bidOrder: any;
+    offerOrder: any;
+    smallerParty: 'BUYER' | 'SELLER';
+    smallerQuantity: number;
+    largerQuantity: number;
+    additionalQuantity: number;
+    timeout: NodeJS.Timeout;
+    createdAt: Date;
+  }> = new Map();
+
+  // Cache for active orders to reduce database hits
+  private lastOrdersCache: any[] = [];
+  private lastCacheTime: number = 0;
+  private cacheValidityMs: number = 30000; // 30 seconds cache
 
   constructor(wsService: WebSocketService) {
     this.wsService = wsService;
@@ -112,6 +131,9 @@ export class MatchingEngine {
 
   private async processMatching(): Promise<void> {
     try {
+      // Update last run timestamp for health check
+      await redisUtils.set('matching:last_run', new Date().toISOString(), 600); // 10 minutes TTL
+      
       // Robust Redis flag logic
       let hasActiveOrders = await redisUtils.get('matching:has_active_orders');
       let activeOrders = [];
@@ -146,24 +168,55 @@ export class MatchingEngine {
 
   private async getActiveOrders(): Promise<any[]> {
     try {
-      return await prisma.order.findMany({
+      // Use cache if it's still valid
+      const now = Date.now();
+      if (this.lastCacheTime && (now - this.lastCacheTime) < this.cacheValidityMs) {
+        console.log(`📋 Using cached orders (${this.lastOrdersCache.length} orders)`);
+        return this.lastOrdersCache;
+      }
+
+      // Fetch fresh data with optimized query
+      const orders = await prisma.order.findMany({
         where: {
           status: 'ACTIVE',
           remaining: { gt: 0 }
         },
+        select: {
+          id: true,
+          action: true,
+          price: true,
+          asset: true,
+          remaining: true,
+          userId: true,
+          createdAt: true
+        },
         orderBy: [
+          { asset: 'asc' }, // Group by asset first for better processing
           { price: 'desc' },
           { createdAt: 'asc' }
         ]
       });
+
+      // Update cache
+      this.lastOrdersCache = orders;
+      this.lastCacheTime = now;
+      
+      console.log(`📋 Fetched ${orders.length} active orders from database`);
+      return orders;
     } catch (error) {
       console.error('Error getting active orders:', error);
-      return [];
+      return this.lastOrdersCache; // Return cached data on error
     }
   }
 
+  // Invalidate cache when orders are updated
+  private invalidateCache(): void {
+    this.lastCacheTime = 0;
+    this.lastOrdersCache = [];
+  }
+
   private async processMatchingInMemory(orders: any[]): Promise<void> {
-    // Group by asset
+    // Group by asset for more efficient processing
     const ordersByAsset: Record<string, any[]> = {};
     
     for (const order of orders) {
@@ -173,10 +226,13 @@ export class MatchingEngine {
       ordersByAsset[order.asset].push(order);
     }
 
-    console.log(`🔍 Processing ${Object.keys(ordersByAsset).length} assets`);
+    console.log(`🔍 Processing ${Object.keys(ordersByAsset).length} assets with ${orders.length} total orders`);
+
+    // Process assets with the most orders first (likely more active markets)
+    const assetEntries = Object.entries(ordersByAsset).sort((a, b) => b[1].length - a[1].length);
 
     // Process each asset
-    for (const [asset, assetOrders] of Object.entries(ordersByAsset)) {
+    for (const [asset, assetOrders] of assetEntries) {
       await this.processAssetMatching(asset, assetOrders);
     }
   }
@@ -217,6 +273,32 @@ export class MatchingEngine {
         // Create a pending quantity confirmation
         const confirmationKey = `${asset}:${bestBid.id}:${bestOffer.id}`;
         
+        // Check if we already have a pending confirmation for these orders
+        if (this.pendingConfirmations.has(confirmationKey)) {
+          console.log(`[MATCHING] Confirmation already pending for ${confirmationKey}, skipping duplicate request`);
+          return;
+        }
+        
+        // Create timeout for the confirmation (30 seconds)
+        const timeout = setTimeout(() => {
+          console.log(`[MATCHING] Quantity confirmation timeout for ${confirmationKey}, proceeding with partial trade`);
+          this.handleQuantityConfirmationResponse(confirmationKey, false);
+        }, 60000); // 60 seconds - increased timeout for better user experience
+        
+        // Store pending confirmation
+        this.pendingConfirmations.set(confirmationKey, {
+          confirmationKey,
+          asset,
+          bidOrder: bestBid,
+          offerOrder: bestOffer,
+          smallerParty,
+          smallerQuantity,
+          largerQuantity,
+          additionalQuantity,
+          timeout,
+          createdAt: new Date()
+        });
+        
         // Send confirmation request to the smaller party
         this.wsService.notifyUser(smallerOrder.userId, 'quantity:confirmation_request', {
           confirmationKey,
@@ -239,18 +321,12 @@ Your order: ${smallerQuantity} lots
 Available: ${largerQuantity} lots
 
 Do you want ${additionalQuantity} additional lots?
-Reply "YES ${confirmationKey.split(':')[1]}" to accept
-Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} lots only
+Reply "YES ${smallerOrder.id.slice(0, 8)}" to accept
+Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lots only
 
-⏰ You have 30 seconds to respond.`;
+⏰ You have 60 seconds to respond.`;
         
         await this.notifyUserViaWhatsApp(smallerOrder.userId, whatsappMessage);
-        
-        // Set a timeout for the confirmation (30 seconds)
-        setTimeout(() => {
-          console.log(`[MATCHING] Quantity confirmation timeout for ${confirmationKey}, proceeding with partial trade`);
-          this.handleQuantityConfirmationResponse(confirmationKey, false);
-        }, 30000);
         
         return; // Wait for confirmation before proceeding
       }
@@ -258,6 +334,12 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
       // If quantities match exactly, proceed with immediate execution
       await this.executeMatch(bestBid, bestOffer);
       return;
+    }
+
+    // 🔥 NEW: Send competitive bidding alerts when prices don't match but are close
+    if (Number(bestBid.price) < Number(bestOffer.price)) {
+      // Prices don't match - send competitive bidding alerts
+      await this.sendCompetitiveBiddingAlerts(asset, bestBid, bestOffer);
     }
 
     // If no negotiation state, start one
@@ -392,47 +474,46 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
   public async handleQuantityConfirmationResponse(confirmationKey: string, accepted: boolean, newQuantity?: number) {
     console.log(`[MATCHING] Quantity confirmation response: ${confirmationKey}, accepted: ${accepted}, newQuantity: ${newQuantity}`);
     
-    const [asset, bidId, offerId] = confirmationKey.split(':');
-    
+    const confirmation = this.pendingConfirmations.get(confirmationKey);
+    if (!confirmation) {
+      console.error(`[MATCHING] No pending confirmation found for key: ${confirmationKey}`);
+      return;
+    }
+
     try {
-      // Get the current orders
-      const bid = await prisma.order.findUnique({ where: { id: bidId } });
-      const offer = await prisma.order.findUnique({ where: { id: offerId } });
-      
-      if (!bid || !offer) {
-        console.error(`[MATCHING] Orders not found for confirmation: ${bidId}, ${offerId}`);
-        return;
-      }
-      
+      // Clear the timeout for the confirmation
+      clearTimeout(confirmation.timeout);
+      this.pendingConfirmations.delete(confirmationKey);
+
       if (accepted && newQuantity) {
         // User accepted and wants to increase their order quantity
-        const smallerParty = Number(bid.remaining) < Number(offer.remaining) ? 'BUYER' : 'SELLER';
+        const smallerParty = confirmation.smallerParty;
         
         if (smallerParty === 'BUYER') {
           // Update buyer's order to match seller's quantity
           await prisma.order.update({
-            where: { id: bidId },
+            where: { id: confirmation.bidOrder.id },
             data: { 
               amount: newQuantity,
               remaining: newQuantity
             }
           });
-          console.log(`[MATCHING] Updated buyer order ${bidId} to ${newQuantity} lots`);
+          console.log(`[MATCHING] Updated buyer order ${confirmation.bidOrder.id} to ${newQuantity} lots`);
         } else {
           // Update seller's order to match buyer's quantity
           await prisma.order.update({
-            where: { id: offerId },
+            where: { id: confirmation.offerOrder.id },
             data: { 
               amount: newQuantity,
               remaining: newQuantity
             }
           });
-          console.log(`[MATCHING] Updated seller order ${offerId} to ${newQuantity} lots`);
+          console.log(`[MATCHING] Updated seller order ${confirmation.offerOrder.id} to ${newQuantity} lots`);
         }
         
         // Now both orders have matching quantities, execute the trade
-        const updatedBid = await prisma.order.findUnique({ where: { id: bidId } });
-        const updatedOffer = await prisma.order.findUnique({ where: { id: offerId } });
+        const updatedBid = await prisma.order.findUnique({ where: { id: confirmation.bidOrder.id } });
+        const updatedOffer = await prisma.order.findUnique({ where: { id: confirmation.offerOrder.id } });
         
         if (updatedBid && updatedOffer) {
           await this.executeMatch(updatedBid, updatedOffer);
@@ -440,7 +521,7 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
       } else {
         // User declined or timeout, proceed with partial trade for smaller quantity
         console.log(`[MATCHING] User declined additional quantity or timeout, proceeding with partial trade`);
-        await this.executeMatch(bid, offer);
+        await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
       }
       
     } catch (error) {
@@ -483,7 +564,7 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
                  matchType === 'PARTIAL_FILL_SELLER' ? 'BUYER_QUANTITY_GREATER_THAN_SELLER' : 'EXACT_MATCH'
       });
 
-      // Execute match with minimal database operations
+      // Execute match with optimized transaction
       const result = await prisma.$transaction(async (tx) => {
         // Create trade
         const trade = await tx.trade.create({
@@ -500,31 +581,32 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
         });
         console.log('[MATCHING] Trade created:', trade);
 
-        // Update orders
+        // Update orders in batch
         const bidRemaining = Number(bid.remaining) - tradeAmount;
         const offerRemaining = Number(offer.remaining) - tradeAmount;
 
-        const updatedBid = await tx.order.update({
-          where: { id: bid.id },
-          data: {
-            remaining: bidRemaining,
-            matched: bidRemaining === 0,
-            counterparty: bidRemaining === 0 ? offer.userId : null,
-            status: bidRemaining === 0 ? 'MATCHED' : 'ACTIVE'
-          }
-        });
-        console.log('[MATCHING] Updated Bid Order:', updatedBid);
+        const [updatedBid, updatedOffer] = await Promise.all([
+          tx.order.update({
+            where: { id: bid.id },
+            data: {
+              remaining: bidRemaining,
+              matched: bidRemaining === 0,
+              counterparty: bidRemaining === 0 ? offer.userId : null,
+              status: bidRemaining === 0 ? 'MATCHED' : 'ACTIVE'
+            }
+          }),
+          tx.order.update({
+            where: { id: offer.id },
+            data: {
+              remaining: offerRemaining,
+              matched: offerRemaining === 0,
+              counterparty: offerRemaining === 0 ? bid.userId : null,
+              status: offerRemaining === 0 ? 'MATCHED' : 'ACTIVE'
+            }
+          })
+        ]);
 
-        const updatedOffer = await tx.order.update({
-          where: { id: offer.id },
-          data: {
-            remaining: offerRemaining,
-            matched: offerRemaining === 0,
-            counterparty: offerRemaining === 0 ? bid.userId : null,
-            status: offerRemaining === 0 ? 'MATCHED' : 'ACTIVE'
-          }
-        });
-        console.log('[MATCHING] Updated Offer Order:', updatedOffer);
+        console.log('[MATCHING] Updated orders in batch');
 
         // Log the specific scenario results
         if (matchType === 'PARTIAL_FILL_BUYER') {
@@ -543,335 +625,183 @@ Reply "NO ${confirmationKey.split(':')[1]}" to proceed with ${smallerQuantity} l
         return;
       }
 
-      // Update order book in Redis FIRST, before publishing events
-      await (new (require('./order-book').OrderBookService)()).updateOrderBookInRedis(bid.asset);
-      console.log('[MATCHING] Order book updated in Redis for asset:', bid.asset);
+      // Invalidate cache after successful trade
+      this.invalidateCache();
 
-      // Publish trade event for trade board
-      await redisUtils.publish('trade:executed', {
-        tradeId: result.trade.id,
-        asset: result.trade.asset,
-        price: result.trade.price,
-        amount: result.trade.amount,
-        buyerId: result.trade.buyerId,
-        sellerId: result.trade.sellerId,
-        timestamp: result.trade.createdAt,
-        // Include order update information for frontend
-        bidFullyMatched: result.bidRemaining === 0,
-        offerFullyMatched: result.offerRemaining === 0,
-        bidOrderId: bid.id,
-        offerOrderId: offer.id,
-        matchType: result.matchType,
-        partialFill: result.matchType !== 'FULL_MATCH'
+      // Update order book in Redis and publish events in parallel
+      const [, ] = await Promise.all([
+        (new (require('./order-book').OrderBookService)()).updateOrderBookInRedis(bid.asset),
+        redisUtils.publish('trade:executed', {
+          tradeId: result.trade.id,
+          asset: result.trade.asset,
+          price: result.trade.price,
+          amount: result.trade.amount,
+          buyerId: result.trade.buyerId,
+          sellerId: result.trade.sellerId,
+          timestamp: result.trade.createdAt,
+          bidFullyMatched: result.bidRemaining === 0,
+          offerFullyMatched: result.offerRemaining === 0,
+          bidOrderId: bid.id,
+          offerOrderId: offer.id,
+          matchType: result.matchType,
+          partialFill: result.matchType !== 'FULL_MATCH'
+        })
+      ]);
+
+      console.log('[MATCHING] Order book updated and trade event published');
+
+      // 🔥 FIXED: Send trade notifications to BOTH parties for ALL trades (including partial fills)
+      Promise.all([
+        this.sendTradeExecutedNotification(bid, result.trade, 'buyer', result.bidRemaining),
+        this.sendTradeExecutedNotification(offer, result.trade, 'seller', result.offerRemaining)
+      ]).catch(error => {
+        console.error('[MATCHING] Error sending trade notifications:', error);
       });
-      console.log('[MATCHING] Trade event published for trade board.');
-
-      // Emit order:matched events for both orders if fully matched
-      if (result.bidRemaining === 0) {
-        console.log('[MATCHING] Bid fully matched, emitting order:matched event');
-        this.wsService.notifyUser(bid.userId, 'order:matched', {
-          orderId: bid.id,
-          status: 'MATCHED',
-          asset: bid.asset,
-          price: tradePrice,
-          amount: tradeAmount,
-          tradeId: result.trade.id,
-          matchType: result.matchType
-        });
-        
-        // 📱 WhatsApp notification for buyer
-        const buyerMessage = `✅ ORDER MATCHED!
-
-${bid.asset.toUpperCase()} Purchase Complete
-Amount: ${tradeAmount} lots
-Price: $${tradePrice} per lot
-Total: $${(tradeAmount * tradePrice).toFixed(2)}
-Order ID: ${bid.id.slice(0, 8)}
-Trade ID: ${result.trade.id.slice(0, 8)}
-
-Your order has been fully executed.`;
-        
-        await this.notifyUserViaWhatsApp(bid.userId, buyerMessage);
-      }
-      if (result.offerRemaining === 0) {
-        console.log('[MATCHING] Offer fully matched, emitting order:matched event');
-        this.wsService.notifyUser(offer.userId, 'order:matched', {
-          orderId: offer.id,
-          status: 'MATCHED',
-          asset: bid.asset,
-          price: tradePrice,
-          amount: tradeAmount,
-          tradeId: result.trade.id,
-          matchType: result.matchType
-        });
-        
-        // 📱 WhatsApp notification for seller
-        const sellerMessage = `✅ ORDER MATCHED!
-
-${offer.asset.toUpperCase()} Sale Complete  
-Amount: ${tradeAmount} lots
-Price: $${tradePrice} per lot
-Total: $${(tradeAmount * tradePrice).toFixed(2)}
-Order ID: ${offer.id.slice(0, 8)}
-Trade ID: ${result.trade.id.slice(0, 8)}
-
-Your order has been fully executed.`;
-        
-        await this.notifyUserViaWhatsApp(offer.userId, sellerMessage);
-      }
-
-      // Handle partial fills - notify the filled party and broadcast remaining to market
-      if (result.matchType === 'PARTIAL_FILL_BUYER' && result.offerRemaining > 0) {
-        console.log(`[MATCHING] 🔄 PARTIAL FILL: Buyer filled, seller has ${result.offerRemaining} remaining`);
-        
-        // Notify buyer about full fill
-        this.wsService.notifyUser(bid.userId, 'order:filled', {
-          orderId: bid.id,
-          asset: bid.asset,
-          amount: tradeAmount,
-          price: tradePrice,
-          tradeId: result.trade.id,
-          message: `Your buy order was fully filled. Purchased ${tradeAmount} units at $${tradePrice}.`
-        });
-
-        // 📱 WhatsApp notification for buyer (full fill)
-        const buyerFillMessage = `🎯 ORDER FILLED!
-
-${bid.asset.toUpperCase()} Purchase Complete
-Amount: ${tradeAmount} lots  
-Price: $${tradePrice} per lot
-Total: $${(tradeAmount * tradePrice).toFixed(2)}
-Order ID: ${bid.id.slice(0, 8)}
-
-Your buy order was fully executed.`;
-        
-        await this.notifyUserViaWhatsApp(bid.userId, buyerFillMessage);
-
-        // Notify seller about partial fill
-        this.wsService.notifyUser(offer.userId, 'order:partial_fill', {
-          orderId: offer.id,
-          asset: bid.asset,
-          originalAmount: offer.amount,
-          filledAmount: tradeAmount,
-          remainingAmount: result.offerRemaining,
-          price: tradePrice,
-          tradeId: result.trade.id,
-          message: `Your sell order was partially filled. ${tradeAmount} units sold at $${tradePrice}, ${result.offerRemaining} units remaining.`
-        });
-
-        // 📱 WhatsApp notification for seller (partial fill)
-        const sellerPartialMessage = `⚡ PARTIAL FILL!
-
-${bid.asset.toUpperCase()} Sale Update
-Sold: ${tradeAmount} lots at $${tradePrice}
-Revenue: $${(tradeAmount * tradePrice).toFixed(2)}
-Remaining: ${result.offerRemaining} lots still for sale
-
-Order ID: ${offer.id.slice(0, 8)}
-Your order is still active for remaining quantity.`;
-        
-        await this.notifyUserViaWhatsApp(offer.userId, sellerPartialMessage);
-
-        // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
-        this.wsService.broadcastMarketUpdate({
-          asset: bid.asset,
-          type: 'remaining_quantity_available',
-          action: 'OFFER', // Remaining quantity is for sale
-          remainingQuantity: result.offerRemaining,
-          price: tradePrice,
-          message: `🔥 TRADE EXECUTED: ${tradeAmount} ${bid.asset} @ $${tradePrice}. ${result.offerRemaining} lots still available for sale at $${tradePrice}!`,
-          tradeExecuted: true,
-          lastTradePrice: tradePrice,
-          lastTradeAmount: tradeAmount
-        });
-
-        // 📱 Broadcast market status to WhatsApp users
-        await this.broadcastMarketStatusToWhatsApp(
-          bid.asset, 
-          `Trade executed! ${tradeAmount} lots @ $${tradePrice}. ${result.offerRemaining} lots still available for sale.`
-        );
-
-      } else if (result.matchType === 'PARTIAL_FILL_SELLER' && result.bidRemaining > 0) {
-        console.log(`[MATCHING] 🔄 PARTIAL FILL: Seller filled, buyer has ${result.bidRemaining} remaining`);
-        
-        // Notify seller about full fill
-        this.wsService.notifyUser(offer.userId, 'order:filled', {
-          orderId: offer.id,
-          asset: bid.asset,
-          amount: tradeAmount,
-          price: tradePrice,
-          tradeId: result.trade.id,
-          message: `Your sell order was fully filled. Sold ${tradeAmount} units at $${tradePrice}.`
-        });
-
-        // 📱 WhatsApp notification for seller (full fill)
-        const sellerFillMessage = `🎯 ORDER FILLED!
-
-${bid.asset.toUpperCase()} Sale Complete
-Amount: ${tradeAmount} lots
-Price: $${tradePrice} per lot  
-Total: $${(tradeAmount * tradePrice).toFixed(2)}
-Order ID: ${offer.id.slice(0, 8)}
-
-Your sell order was fully executed.`;
-        
-        await this.notifyUserViaWhatsApp(offer.userId, sellerFillMessage);
-
-        // Notify buyer about partial fill
-        this.wsService.notifyUser(bid.userId, 'order:partial_fill', {
-          orderId: bid.id,
-          asset: bid.asset,
-          originalAmount: bid.amount,
-          filledAmount: tradeAmount,
-          remainingAmount: result.bidRemaining,
-          price: tradePrice,
-          tradeId: result.trade.id,
-          message: `Your buy order was partially filled. ${tradeAmount} units purchased at $${tradePrice}, ${result.bidRemaining} units remaining.`
-        });
-
-        // 📱 WhatsApp notification for buyer (partial fill)
-        const buyerPartialMessage = `⚡ PARTIAL FILL!
-
-${bid.asset.toUpperCase()} Purchase Update
-Bought: ${tradeAmount} lots at $${tradePrice}
-Cost: $${(tradeAmount * tradePrice).toFixed(2)}
-Still needed: ${result.bidRemaining} lots
-
-Order ID: ${bid.id.slice(0, 8)}
-Your order is still active for remaining quantity.`;
-        
-        await this.notifyUserViaWhatsApp(bid.userId, buyerPartialMessage);
-
-        // 🚨 BROADCAST TO ALL RELEVANT COUNTERPARTIES ABOUT REMAINING QUANTITY
-        this.wsService.broadcastMarketUpdate({
-          asset: bid.asset,
-          type: 'remaining_quantity_available',
-          action: 'BID', // Remaining quantity is wanted for purchase
-          remainingQuantity: result.bidRemaining,
-          price: tradePrice,
-          message: `🔥 TRADE EXECUTED: ${tradeAmount} ${bid.asset} @ $${tradePrice}. ${result.bidRemaining} lots still wanted at $${tradePrice}!`,
-          tradeExecuted: true,
-          lastTradePrice: tradePrice,
-          lastTradeAmount: tradeAmount
-        });
-
-        // 📱 Broadcast market status to WhatsApp users
-        await this.broadcastMarketStatusToWhatsApp(
-          bid.asset, 
-          `Trade executed! ${tradeAmount} lots @ $${tradePrice}. ${result.bidRemaining} lots still wanted for purchase.`
-        );
-      } else {
-        // Full match - broadcast successful trade completion
-        this.wsService.broadcastMarketUpdate({
-          asset: bid.asset,
-          type: 'trade_completed',
-          message: `✅ TRADE COMPLETED: ${tradeAmount} ${bid.asset} @ $${tradePrice}`,
-          tradeExecuted: true,
-          lastTradePrice: tradePrice,
-          lastTradeAmount: tradeAmount
-        });
-        
-        // 📱 Broadcast full trade completion to WhatsApp users
-        await this.broadcastMarketStatusToWhatsApp(
-          bid.asset, 
-          `Full trade completed! ${tradeAmount} lots @ $${tradePrice}. Market cleared for this price level.`
-        );
-      }
-
-      // Always broadcast updated market data to show new best orders after this trade
-      const updatedMarketData = await (new (require('./order-book').OrderBookService)()).getMarketData();
-      const assetMarketData = updatedMarketData.find((m: any) => m.asset === bid.asset);
-      
-      if (assetMarketData) {
-        this.wsService.broadcastMarketUpdate({
-          asset: bid.asset,
-          ...assetMarketData,
-          tradeExecuted: true,
-          lastTradePrice: tradePrice,
-          lastTradeAmount: tradeAmount,
-          matchType: result.matchType
-        });
-      }
-
-      // Handle partial fill logic
-      if (result.bidRemaining > 0 && result.offerRemaining === 0) {
-        console.log('[MATCHING] Partial fill: bid still has remaining, offer fully matched.');
-        // Notify buyer for remaining lots
-        this.wsService.notifyUser(bid.userId, 'partial_fill', {
-          asset: bid.asset,
-          remaining: result.bidRemaining,
-          price: tradePrice,
-          message: `You have ${result.bidRemaining} lots remaining for ${bid.asset} at ${tradePrice}. Would you like to buy the rest?`
-        });
-
-        // Set up a listener for buyer response (pseudo event, you must handle this on the frontend)
-        const responseHandler = async (response: { userId: string, accept: boolean }) => {
-          console.log('[MATCHING] Partial fill response received:', response);
-          if (response.userId === bid.userId) {
-            clearTimeout(this.pendingPartialFills.get(bid.id));
-            this.pendingPartialFills.delete(bid.id);
-            if (response.accept) {
-              // Create a new order for the remaining lots
-              await prisma.order.create({
-                data: {
-                  action: 'BID',
-                  price: tradePrice,
-                  asset: bid.asset,
-                  amount: result.bidRemaining,
-                  remaining: result.bidRemaining,
-                  matched: false,
-                  counterparty: null,
-                  status: 'ACTIVE',
-                  expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                  metadata: {},
-                  userId: bid.userId
-                }
-              });
-              await redisUtils.set('matching:has_active_orders', true, 300);
-              console.log('[MATCHING] New order created for remaining lots after partial fill.');
-            } else {
-              // Notify all traders about remaining lots
-              this.wsService.broadcastMarketUpdate({
-                asset: bid.asset,
-                remaining: result.bidRemaining,
-                price: tradePrice,
-                message: `A trade occurred at ${tradePrice} for ${bid.asset}. ${result.bidRemaining} lots remain available.`
-              });
-              console.log('[MATCHING] Buyer declined remaining lots after partial fill.');
-            }
-          }
-        };
-        // Listen for a custom event (pseudo-code, you must wire this up in your websocket event handlers)
-        this.wsService.getIO().once(`partial_fill_response:${bid.userId}:${bid.id}`, responseHandler);
-
-        // Set a timeout for buyer response (e.g., 60 seconds)
-        const timeout = setTimeout(() => {
-          this.wsService.getIO().removeListener(`partial_fill_response:${bid.userId}:${bid.id}`, responseHandler);
-          this.pendingPartialFills.delete(bid.id);
-          // Notify all traders about remaining lots
-          this.wsService.broadcastMarketUpdate({
-            asset: bid.asset,
-            remaining: result.bidRemaining,
-            price: tradePrice,
-            message: `A trade occurred at ${tradePrice} for ${bid.asset}. ${result.bidRemaining} lots remain available.`
-          });
-          console.warn('[MATCHING] Partial fill response timed out.');
-        }, 60000);
-        this.pendingPartialFills.set(bid.id, timeout);
-      } else if (result.offerRemaining > 0 && result.bidRemaining === 0) {
-        // Notify all traders about remaining lots
-        this.wsService.broadcastMarketUpdate({
-          asset: offer.asset,
-          remaining: result.offerRemaining,
-          price: tradePrice,
-          message: `A trade occurred at ${tradePrice} for ${offer.asset}. ${result.offerRemaining} lots remain available.`
-        });
-        console.log('[MATCHING] Offer still has remaining after trade.');
-      }
 
       console.log(`💱 Trade executed: ${tradeAmount} ${bid.asset} @ ${tradePrice}`);
     } catch (error) {
       console.error('[MATCHING] Error executing match:', error);
+    }
+  }
+
+  // 🔥 NEW: Enhanced trade notification method that handles both full and partial fills
+  private async sendTradeExecutedNotification(order: any, trade: any, side: 'buyer' | 'seller', remainingAmount: number): Promise<void> {
+    try {
+      const isFullyFilled = remainingAmount === 0;
+      const isPartialFill = !isFullyFilled;
+      
+      // WebSocket notification
+      this.wsService.notifyUser(order.userId, 'trade:executed', {
+        orderId: order.id,
+        asset: order.asset,
+        price: trade.price,
+        amount: trade.amount,
+        tradeId: trade.id,
+        side,
+        isFullyFilled,
+        isPartialFill,
+        remainingAmount,
+        originalAmount: order.amount
+      });
+      
+      // 📱 WhatsApp notification - enhanced for partial fills
+      let message = '';
+      if (isFullyFilled) {
+        message = `✅ TRADE EXECUTED! 
+
+${order.asset.toUpperCase()} ${side === 'buyer' ? 'Purchase' : 'Sale'} COMPLETE
+Amount: ${trade.amount} lots
+Price: $${trade.price} per lot
+Total: $${(trade.amount * trade.price).toFixed(2)}
+Order ID: ${order.id.slice(0, 8)}
+Trade ID: ${trade.id.slice(0, 8)}
+
+🎉 Your order has been FULLY executed!`;
+      } else {
+        message = `✅ TRADE EXECUTED!
+
+${order.asset.toUpperCase()} ${side === 'buyer' ? 'Purchase' : 'Sale'} - PARTIAL FILL
+Traded: ${trade.amount} lots
+Price: $${trade.price} per lot
+Total: $${(trade.amount * trade.price).toFixed(2)}
+Remaining: ${remainingAmount} lots still active
+Order ID: ${order.id.slice(0, 8)}
+Trade ID: ${trade.id.slice(0, 8)}
+
+⏳ Your order remains active for the remaining ${remainingAmount} lots.`;
+      }
+      
+      await this.notifyUserViaWhatsApp(order.userId, message);
+    } catch (error) {
+      console.error(`[MATCHING] Error sending ${side} trade notification:`, error);
+    }
+  }
+
+  // Helper method to send order matched notifications (kept for backward compatibility)
+  private async sendOrderMatchedNotification(order: any, trade: any, side: 'buyer' | 'seller'): Promise<void> {
+    try {
+      this.wsService.notifyUser(order.userId, 'order:matched', {
+        orderId: order.id,
+        status: 'MATCHED',
+        asset: order.asset,
+        price: trade.price,
+        amount: trade.amount,
+        tradeId: trade.id,
+        side
+      });
+      
+      // WhatsApp notification
+      const message = `✅ ORDER MATCHED!
+
+${order.asset.toUpperCase()} ${side === 'buyer' ? 'Purchase' : 'Sale'} Complete
+Amount: ${trade.amount} lots
+Price: $${trade.price} per lot
+Total: $${(trade.amount * trade.price).toFixed(2)}
+Order ID: ${order.id.slice(0, 8)}
+Trade ID: ${trade.id.slice(0, 8)}
+
+Your order has been fully executed.`;
+      
+      await this.notifyUserViaWhatsApp(order.userId, message);
+    } catch (error) {
+      console.error(`[MATCHING] Error sending ${side} notification:`, error);
+    }
+  }
+
+  // 🔥 NEW: Send competitive bidding alerts when there are nearby orders
+  public async sendCompetitiveBiddingAlerts(asset: string, bestBid: any, bestOffer: any): Promise<void> {
+    try {
+      // Only send alerts if bid and offer prices are close but not matching
+      const bidPrice = Number(bestBid.price);
+      const offerPrice = Number(bestOffer.price);
+      
+      if (bidPrice >= offerPrice) {
+        // Prices match or cross - will be handled by normal matching logic
+        return;
+      }
+      
+      // Calculate spread
+      const spread = offerPrice - bidPrice;
+      const spreadPercentage = (spread / bidPrice) * 100;
+      
+      // Only send alerts if spread is reasonable (less than 20%)
+      if (spreadPercentage > 20) {
+        return;
+      }
+      
+      console.log(`[COMPETITIVE] Sending bidding alerts for ${asset}: Bid $${bidPrice} vs Offer $${offerPrice} (spread: ${spread.toFixed(2)})`);
+      
+      // Alert to bid holder about the offer
+      const bidMessage = `💰 COMPETITIVE BIDDING ALERT!
+
+${asset.toUpperCase()}
+Your BID: ${bestBid.remaining} lots @ $${bidPrice}
+Available OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 Consider improving your bid price to $${offerPrice} to trade immediately!
+Your Order ID: ${bestBid.id.slice(0, 8)}`;
+
+      // Alert to offer holder about the bid  
+      const offerMessage = `💰 COMPETITIVE BIDDING ALERT!
+
+${asset.toUpperCase()}
+Your OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
+Available BID: ${bestBid.remaining} lots @ $${bidPrice}
+Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+
+💡 Consider lowering your offer price to $${bidPrice} to trade immediately!
+Your Order ID: ${bestOffer.id.slice(0, 8)}`;
+
+      // Send notifications in parallel
+      await Promise.all([
+        this.notifyUserViaWhatsApp(bestBid.userId, bidMessage),
+        this.notifyUserViaWhatsApp(bestOffer.userId, offerMessage)
+      ]);
+      
+      console.log(`[COMPETITIVE] Sent bidding alerts to bid holder (${bestBid.userId}) and offer holder (${bestOffer.userId})`);
+    } catch (error) {
+      console.error('[COMPETITIVE] Error sending competitive bidding alerts:', error);
     }
   }
 
@@ -920,5 +850,84 @@ Your order is still active for remaining quantity.`;
   // Method to mark that there are active orders (called when orders are created)
   public async markActiveOrders(): Promise<void> {
     await redisUtils.set('matching:has_active_orders', true, 300); // 5 minutes
+  }
+
+  // Method to get pending confirmation by order ID part (for WhatsApp responses)
+  public getPendingConfirmationByOrderId(orderIdPart: string): string | null {
+    for (const [confirmationKey, confirmation] of this.pendingConfirmations) {
+      // Check if either bid or offer order ID starts with the provided part
+      if (confirmation.bidOrder.id.startsWith(orderIdPart) || 
+          confirmation.offerOrder.id.startsWith(orderIdPart)) {
+        return confirmationKey;
+      }
+    }
+    return null;
+  }
+
+  // Method to check if a user has pending confirmations
+  public getUserPendingConfirmations(userId: string): Array<{confirmationKey: string; details: any}> {
+    const userConfirmations = [];
+    for (const [confirmationKey, confirmation] of this.pendingConfirmations) {
+      // Check if this user is the one being asked for confirmation
+      const isUserInvolved = (confirmation.smallerParty === 'BUYER' && confirmation.bidOrder.userId === userId) ||
+                            (confirmation.smallerParty === 'SELLER' && confirmation.offerOrder.userId === userId);
+      
+      if (isUserInvolved) {
+        userConfirmations.push({
+          confirmationKey,
+          details: {
+            asset: confirmation.asset,
+            yourQuantity: confirmation.smallerQuantity,
+            availableQuantity: confirmation.largerQuantity,
+            additionalQuantity: confirmation.additionalQuantity,
+            side: confirmation.smallerParty
+          }
+        });
+      }
+    }
+    return userConfirmations;
+  }
+
+  // Public method to immediately process matching for a specific asset
+  public async processAsset(asset: string): Promise<void> {
+    try {
+      // Fetch active orders for this specific asset
+      const orders = await prisma.order.findMany({
+        where: {
+          asset,
+          status: 'ACTIVE',
+          remaining: { gt: 0 }
+        },
+        select: {
+          id: true,
+          action: true,
+          price: true,
+          asset: true,
+          remaining: true,
+          userId: true,
+          createdAt: true
+        },
+        orderBy: [
+          { price: 'desc' },
+          { createdAt: 'asc' }
+        ]
+      });
+
+      if (orders.length < 2) {
+        console.log(`[MATCHING] Not enough orders for asset ${asset} (${orders.length} orders)`);
+        return;
+      }
+
+      console.log(`[MATCHING] Immediate processing for asset ${asset} with ${orders.length} orders`);
+      
+      // Process matching for this specific asset
+      await this.processAssetMatching(asset, orders);
+      
+      // Invalidate cache to force fresh data on next periodic run
+      this.invalidateCache();
+      
+    } catch (error) {
+      console.error(`[MATCHING] Error in immediate asset processing for ${asset}:`, error);
+    }
   }
 } 
