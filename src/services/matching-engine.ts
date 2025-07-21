@@ -32,12 +32,17 @@ export class MatchingEngine {
     additionalQuantity: number;
     timeout: NodeJS.Timeout;
     createdAt: Date;
+    // New fields for two-step approval
+    state?: 'AWAITING_SMALLER' | 'AWAITING_LARGER';
+    smallerPartyResponse?: boolean;
   }> = new Map();
 
   // Cache for active orders to reduce database hits
   private lastOrdersCache: any[] = [];
   private lastCacheTime: number = 0;
   private cacheValidityMs: number = 30000; // 30 seconds cache
+
+  private declinedPartialFills: Set<string> = new Set();
 
   constructor(wsService: WebSocketService) {
     this.wsService = wsService;
@@ -273,9 +278,15 @@ export class MatchingEngine {
         // Create a pending quantity confirmation
         const confirmationKey = `${asset}:${bestBid.id}:${bestOffer.id}`;
         
-        // Check if we already have a pending confirmation for these orders
+        // Debug: Check for existing confirmation
         if (this.pendingConfirmations.has(confirmationKey)) {
-          console.log(`[MATCHING] Confirmation already pending for ${confirmationKey}, skipping duplicate request`);
+          console.log(`[MATCHING][DEBUG] Confirmation already pending for ${confirmationKey}, skipping duplicate request. State:`, this.pendingConfirmations.get(confirmationKey)?.state);
+          return;
+        }
+        
+        // Robust: Check if this pair was previously declined
+        if (this.declinedPartialFills.has(confirmationKey)) {
+          console.log(`[MATCHING][DEBUG] Skipping partial fill for ${confirmationKey} as it was previously declined.`);
           return;
         }
         
@@ -296,7 +307,8 @@ export class MatchingEngine {
           largerQuantity,
           additionalQuantity,
           timeout,
-          createdAt: new Date()
+          createdAt: new Date(),
+          state: 'AWAITING_SMALLER',
         });
         
         // Send confirmation request to the smaller party
@@ -472,58 +484,73 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
 
   // Handle quantity confirmation responses
   public async handleQuantityConfirmationResponse(confirmationKey: string, accepted: boolean, newQuantity?: number) {
-    console.log(`[MATCHING] Quantity confirmation response: ${confirmationKey}, accepted: ${accepted}, newQuantity: ${newQuantity}`);
-    
     const confirmation = this.pendingConfirmations.get(confirmationKey);
     if (!confirmation) {
-      console.error(`[MATCHING] No pending confirmation found for key: ${confirmationKey}`);
+      console.log(`[MATCHING][DEBUG] No pending confirmation found for key: ${confirmationKey}`);
       return;
     }
-
     try {
-      // Clear the timeout for the confirmation
       clearTimeout(confirmation.timeout);
-      this.pendingConfirmations.delete(confirmationKey);
-
-      if (accepted && newQuantity) {
-        // User accepted and wants to increase their order quantity
-        const smallerParty = confirmation.smallerParty;
-        
-        if (smallerParty === 'BUYER') {
-          // Update buyer's order to match seller's quantity
-          await prisma.order.update({
-            where: { id: confirmation.bidOrder.id },
-            data: { 
-              amount: newQuantity,
-              remaining: newQuantity
-            }
-          });
-          console.log(`[MATCHING] Updated buyer order ${confirmation.bidOrder.id} to ${newQuantity} lots`);
+      // Step 1: Awaiting smaller party
+      if (confirmation.state === 'AWAITING_SMALLER') {
+        confirmation.smallerPartyResponse = accepted;
+        if (accepted && newQuantity) {
+          // User accepted and wants to increase their order quantity
+          const smallerParty = confirmation.smallerParty;
+          if (smallerParty === 'BUYER') {
+            await prisma.order.update({ where: { id: confirmation.bidOrder.id }, data: { amount: newQuantity, remaining: newQuantity } });
+          } else {
+            await prisma.order.update({ where: { id: confirmation.offerOrder.id }, data: { amount: newQuantity, remaining: newQuantity } });
+          }
+          const updatedBid = await prisma.order.findUnique({ where: { id: confirmation.bidOrder.id } });
+          const updatedOffer = await prisma.order.findUnique({ where: { id: confirmation.offerOrder.id } });
+          if (updatedBid && updatedOffer) {
+            this.pendingConfirmations.delete(confirmationKey);
+            await this.executeMatch(updatedBid, updatedOffer);
+          }
+          console.log(`[MATCHING][DEBUG] Smaller party accepted. Executing match for increased quantity.`);
+          return;
         } else {
-          // Update seller's order to match buyer's quantity
-          await prisma.order.update({
-            where: { id: confirmation.offerOrder.id },
-            data: { 
-              amount: newQuantity,
-              remaining: newQuantity
-            }
+          // User declined or timeout, now ask the larger party
+          confirmation.state = 'AWAITING_LARGER';
+          // Set new timeout for larger party
+          confirmation.timeout = setTimeout(() => {
+            this.handleQuantityConfirmationResponse(confirmationKey, false);
+          }, 60000);
+          // Notify larger party
+          const largerParty = confirmation.smallerParty === 'BUYER' ? 'SELLER' : 'BUYER';
+          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
+          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_approval', {
+            confirmationKey,
+            asset: confirmation.asset,
+            yourOrderId: largerOrder.id,
+            counterpartyOrderId: confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder.id : confirmation.offerOrder.id,
+            yourQuantity: confirmation.largerQuantity,
+            partialFillQuantity: confirmation.smallerQuantity,
+            price: confirmation.bidOrder.price,
+            side: largerParty === 'BUYER' ? 'BUY' : 'SELL',
+            message: `Do you want to ${largerParty === 'BUYER' ? 'buy' : 'sell'} only ${confirmation.smallerQuantity} lots at $${confirmation.bidOrder.price}? (Your order is for ${confirmation.largerQuantity} lots)`
           });
-          console.log(`[MATCHING] Updated seller order ${confirmation.offerOrder.id} to ${newQuantity} lots`);
+          const whatsappMessage = `⚠️ PARTIAL FILL APPROVAL NEEDED\n\n${confirmation.asset.toUpperCase()} @ $${confirmation.bidOrder.price}\nYour order: ${confirmation.largerQuantity} lots\nCounterparty: ${confirmation.smallerQuantity} lots\n\nDo you want to proceed with a partial fill for ${confirmation.smallerQuantity} lots?\nReply "YES ${largerOrder.id.slice(0, 8)}" to accept\nReply "NO ${largerOrder.id.slice(0, 8)}" to keep your order active.\n\n⏰ You have 60 seconds to respond.`;
+          await this.notifyUserViaWhatsApp(largerOrder.userId, whatsappMessage);
+          console.log(`[MATCHING][DEBUG] Smaller party declined. State set to AWAITING_LARGER. Notified larger party (${largerOrder.userId}).`);
+          // Do not delete confirmation yet
+          return;
         }
-        
-        // Now both orders have matching quantities, execute the trade
-        const updatedBid = await prisma.order.findUnique({ where: { id: confirmation.bidOrder.id } });
-        const updatedOffer = await prisma.order.findUnique({ where: { id: confirmation.offerOrder.id } });
-        
-        if (updatedBid && updatedOffer) {
-          await this.executeMatch(updatedBid, updatedOffer);
-        }
-      } else {
-        // User declined or timeout, proceed with partial trade for smaller quantity
-        console.log(`[MATCHING] User declined additional quantity or timeout, proceeding with partial trade`);
-        await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
       }
-      
+      // Step 2: Awaiting larger party
+      if (confirmation.state === 'AWAITING_LARGER') {
+        this.pendingConfirmations.delete(confirmationKey);
+        if (accepted) {
+          console.log(`[MATCHING][DEBUG] Larger party accepted partial fill. Executing match for smaller quantity.`);
+          await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
+        } else {
+          // Robust: Mark this pair as declined so it won't be retried
+          this.declinedPartialFills.add(confirmationKey);
+          console.log(`[MATCHING][DEBUG] Larger party declined partial fill. No trade executed. Confirmation deleted. Marked as declined for this pair.`);
+        }
+        return;
+      }
     } catch (error) {
       console.error('[MATCHING] Error handling quantity confirmation response:', error);
     }

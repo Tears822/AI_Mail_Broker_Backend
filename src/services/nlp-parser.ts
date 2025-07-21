@@ -511,44 +511,67 @@ Status: ${order.status}`;
           };
         }
         
-        // Get confirmation details to determine new quantity
-        const userConfirmations = matchingEngine.getUserPendingConfirmations(session.userId);
-        const userConfirmation = userConfirmations.find((c: {confirmationKey: string; details: any}) => c.confirmationKey === confirmationKey);
-        
-        if (!userConfirmation) {
+        // Get the confirmation object directly for robust state/party check
+        const confirmation = matchingEngine['pendingConfirmations'].get(confirmationKey);
+        if (!confirmation) {
           return {
             success: false,
             response: '',
-            error: 'Invalid confirmation - this request was not sent to you.'
+            error: 'No pending confirmation found for that order. The confirmation may have expired.'
           };
         }
-        
-        let newQuantity: number | undefined;
-        if (accepted) {
-          // User wants to increase to the larger quantity
-          newQuantity = userConfirmation.details.availableQuantity;
+        // Determine if this user is the smaller or larger party and which step
+        let isSmallerParty = false;
+        let isLargerParty = false;
+        if (confirmation.smallerParty === 'BUYER' && confirmation.bidOrder.userId === session.userId) {
+          isSmallerParty = true;
+        } else if (confirmation.smallerParty === 'SELLER' && confirmation.offerOrder.userId === session.userId) {
+          isSmallerParty = true;
+        } else if (confirmation.smallerParty === 'BUYER' && confirmation.offerOrder.userId === session.userId) {
+          isLargerParty = true;
+        } else if (confirmation.smallerParty === 'SELLER' && confirmation.bidOrder.userId === session.userId) {
+          isLargerParty = true;
         }
-        
-        // Call the matching engine to handle the response
-        await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted, newQuantity);
-        
-        if (accepted) {
-          return {
-            success: true,
-            response: `✅ Confirmation ACCEPTED! 
-
-You've agreed to trade ${userConfirmation.details.availableQuantity} lots of ${userConfirmation.details.asset} instead of ${userConfirmation.details.yourQuantity} lots.
-
-Your order is being updated and the trade will execute automatically.`
-          };
-        } else {
-          return {
-            success: true,
-            response: `✅ Confirmation received: NO
-
-You've chosen to proceed with your original ${userConfirmation.details.yourQuantity} lots order. The trade will execute for the smaller quantity.`
-          };
+        // Step 1: Smaller party approval
+        if (confirmation.state === 'AWAITING_SMALLER' && isSmallerParty) {
+          let newQuantity: number | undefined;
+          if (accepted) {
+            newQuantity = confirmation.largerQuantity;
+          }
+          await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted, newQuantity);
+          if (accepted) {
+            return {
+              success: true,
+              response: `✅ Confirmation ACCEPTED!\n\nYou've agreed to trade ${confirmation.largerQuantity} lots of ${confirmation.asset} instead of ${confirmation.smallerQuantity} lots.\n\nYour order is being updated and the trade will execute automatically.`
+            };
+          } else {
+            return {
+              success: true,
+              response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. Waiting for counterparty approval for a partial fill.`
+            };
+          }
         }
+        // Step 2: Larger party approval
+        if (confirmation.state === 'AWAITING_LARGER' && isLargerParty) {
+          await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted);
+          if (accepted) {
+            return {
+              success: true,
+              response: `✅ Partial Fill APPROVED!\n\nYou've agreed to a partial fill for ${confirmation.smallerQuantity} lots of ${confirmation.asset}. The trade will execute now.`
+            };
+          } else {
+            return {
+              success: true,
+              response: `❌ Partial Fill DECLINED.\n\nYou declined the partial fill. No trade was executed. Your order remains active for the full amount.`
+            };
+          }
+        }
+        // If user is not authorized to respond
+        return {
+          success: false,
+          response: '',
+          error: 'This confirmation request was not sent to you or is not in the correct state.'
+        };
       }
     }
 
