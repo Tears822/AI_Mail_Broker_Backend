@@ -547,7 +547,7 @@ Status: ${order.status}`;
           } else {
             return {
               success: true,
-              response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. Waiting for counterparty approval for a partial fill.`
+              response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. The counterparty will now be asked to approve a partial fill for ${confirmation.smallerQuantity} lots.`
             };
           }
         }

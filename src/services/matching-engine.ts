@@ -58,9 +58,12 @@ export class MatchingEngine {
         select: { phone: true, username: true }
       });
       
+      console.log(`[WHATSAPP][DEBUG] Attempting to send message to user ${userId} (${user?.username || 'Unknown'})`);
+      console.log(`[WHATSAPP][DEBUG] Message preview: ${message.substring(0, 100)}...`);
+      
       if (user?.phone) {
         await sendWhatsAppMessage(user.phone, message);
-        console.log(`📱 WhatsApp notification sent to ${user.username}: ${message.substring(0, 50)}...`);
+        console.log(`📱 WhatsApp notification sent to ${user.username} (${userId}): ${message.substring(0, 50)}...`);
       } else {
         console.log(`[WHATSAPP] No phone number found for user ${userId}`);
       }
@@ -272,6 +275,15 @@ export class MatchingEngine {
         const smallerParty = bidQuantity < offerQuantity ? 'BUYER' : 'SELLER';
         const smallerOrder = bidQuantity < offerQuantity ? bestBid : bestOffer;
         const largerOrder = bidQuantity < offerQuantity ? bestOffer : bestBid;
+
+        console.log(`[MATCHING][DEBUG] Quantity mismatch analysis:`);
+        console.log(`[MATCHING][DEBUG] - Bid: ${bidQuantity} lots by user ${bestBid.userId} (order: ${bestBid.id.slice(0, 8)})`);
+        console.log(`[MATCHING][DEBUG] - Offer: ${offerQuantity} lots by user ${bestOffer.userId} (order: ${bestOffer.id.slice(0, 8)})`);
+        console.log(`[MATCHING][DEBUG] - bidQuantity < offerQuantity? ${bidQuantity} < ${offerQuantity} = ${bidQuantity < offerQuantity}`);
+        console.log(`[MATCHING][DEBUG] - smallerParty: ${smallerParty}`);
+        console.log(`[MATCHING][DEBUG] - smallerOrder: ${smallerOrder.id.slice(0, 8)} (user: ${smallerOrder.userId})`);
+        console.log(`[MATCHING][DEBUG] - largerOrder: ${largerOrder.id.slice(0, 8)} (user: ${largerOrder.userId})`);
+        console.log(`[MATCHING][DEBUG] - Asking ${smallerParty} (user: ${smallerOrder.userId}) if they want additional ${additionalQuantity} lots`);
         
         console.log(`[MATCHING] Quantity mismatch detected: ${smallerParty} has ${smallerQuantity}, other party has ${largerQuantity}. Asking ${smallerParty} if they want additional ${additionalQuantity} lots.`);
         
@@ -520,6 +532,21 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
           // Notify larger party
           const largerParty = confirmation.smallerParty === 'BUYER' ? 'SELLER' : 'BUYER';
           const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
+          const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
+          
+          // First, notify the larger party that the smaller party declined
+          this.wsService.notifyUser(largerOrder.userId, 'quantity:counterparty_declined', {
+            message: `The counterparty declined to increase their order. They want to trade only ${confirmation.smallerQuantity} lots.`,
+            asset: confirmation.asset,
+            counterpartyQuantity: confirmation.smallerQuantity,
+            yourQuantity: confirmation.largerQuantity
+          });
+          
+          // Send WhatsApp notification about the decline
+          const declineMessage = `❌ COUNTERPARTY DECLINED\n\n${confirmation.asset.toUpperCase()} @ $${confirmation.bidOrder.price}\n\nThe ${confirmation.smallerParty === 'BUYER' ? 'buyer' : 'seller'} declined to increase their order from ${confirmation.smallerQuantity} to ${confirmation.largerQuantity} lots.\n\nThey only want to trade ${confirmation.smallerQuantity} lots.`;
+          await this.notifyUserViaWhatsApp(largerOrder.userId, declineMessage);
+          
+          // Then ask the larger party if they want to proceed with partial fill
           this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_approval', {
             confirmationKey,
             asset: confirmation.asset,
@@ -533,7 +560,7 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
           });
           const whatsappMessage = `⚠️ PARTIAL FILL APPROVAL NEEDED\n\n${confirmation.asset.toUpperCase()} @ $${confirmation.bidOrder.price}\nYour order: ${confirmation.largerQuantity} lots\nCounterparty: ${confirmation.smallerQuantity} lots\n\nDo you want to proceed with a partial fill for ${confirmation.smallerQuantity} lots?\nReply "YES ${largerOrder.id.slice(0, 8)}" to accept\nReply "NO ${largerOrder.id.slice(0, 8)}" to keep your order active.\n\n⏰ You have 60 seconds to respond.`;
           await this.notifyUserViaWhatsApp(largerOrder.userId, whatsappMessage);
-          console.log(`[MATCHING][DEBUG] Smaller party declined. State set to AWAITING_LARGER. Notified larger party (${largerOrder.userId}).`);
+          console.log(`[MATCHING][DEBUG] Smaller party declined. Notified larger party (${largerOrder.userId}) about decline and asked for partial fill approval.`);
           // Do not delete confirmation yet
           return;
         }
@@ -545,6 +572,18 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
           console.log(`[MATCHING][DEBUG] Larger party accepted partial fill. Executing match for smaller quantity.`);
           await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
         } else {
+          // Larger party declined, do not execute trade
+          // Notify both parties
+          const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
+          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
+          this.wsService.notifyUser(smallerOrder.userId, 'quantity:partial_fill_declined', {
+            message: 'Partial fill was declined by the counterparty. No trade was executed.'
+          });
+          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_declined', {
+            message: 'You declined the partial fill. No trade was executed.'
+          });
+          await this.notifyUserViaWhatsApp(smallerOrder.userId, '❌ PARTIAL FILL DECLINED\n\nThe counterparty declined the partial fill. No trade was executed. Your order remains active.');
+          await this.notifyUserViaWhatsApp(largerOrder.userId, '❌ PARTIAL FILL DECLINED\n\nYou declined the partial fill. No trade was executed. Your order remains active for the full amount.');
           // Robust: Mark this pair as declined so it won't be retried
           this.declinedPartialFills.add(confirmationKey);
           console.log(`[MATCHING][DEBUG] Larger party declined partial fill. No trade executed. Confirmation deleted. Marked as declined for this pair.`);
@@ -697,7 +736,11 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
       const isFullyFilled = remainingAmount === 0;
       const isPartialFill = !isFullyFilled;
       
-      // WebSocket notification
+      console.log(`[TRADE][DEBUG] Sending trade notification to ${side} (user: ${order.userId})`);
+      console.log(`[TRADE][DEBUG] - Trade: ${trade.amount} ${order.asset} @ $${trade.price}`);
+      console.log(`[TRADE][DEBUG] - Fully filled: ${isFullyFilled}, Remaining: ${remainingAmount}`);
+      
+      // WebSocket notification - enhanced to match WhatsApp format exactly
       this.wsService.notifyUser(order.userId, 'trade:executed', {
         orderId: order.id,
         asset: order.asset,
@@ -708,7 +751,11 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
         isFullyFilled,
         isPartialFill,
         remainingAmount,
-        originalAmount: order.amount
+        originalAmount: order.amount,
+        total: (trade.amount * trade.price).toFixed(2),
+        message: isFullyFilled 
+          ? `✅ TRADE EXECUTED!\n\n${order.asset.toUpperCase()} ${side === 'buyer' ? 'Purchase' : 'Sale'} COMPLETE\nAmount: ${trade.amount} lots\nPrice: $${trade.price} per lot\nTotal: $${(trade.amount * trade.price).toFixed(2)}\nOrder ID: ${order.id.slice(0, 8)}\nTrade ID: ${trade.id.slice(0, 8)}\n\n🎉 Your order has been FULLY executed!`
+          : `✅ TRADE EXECUTED!\n\n${order.asset.toUpperCase()} ${side === 'buyer' ? 'Purchase' : 'Sale'} - PARTIAL FILL\nTraded: ${trade.amount} lots\nPrice: $${trade.price} per lot\nTotal: $${(trade.amount * trade.price).toFixed(2)}\nRemaining: ${remainingAmount} lots still active\nOrder ID: ${order.id.slice(0, 8)}\nTrade ID: ${trade.id.slice(0, 8)}\n\n⏳ Your order remains active for the remaining ${remainingAmount} lots.`
       });
       
       // 📱 WhatsApp notification - enhanced for partial fills
@@ -738,6 +785,7 @@ Trade ID: ${trade.id.slice(0, 8)}
 ⏳ Your order remains active for the remaining ${remainingAmount} lots.`;
       }
       
+      console.log(`[TRADE][DEBUG] Sending WhatsApp trade confirmation to ${side} (user: ${order.userId})`);
       await this.notifyUserViaWhatsApp(order.userId, message);
     } catch (error) {
       console.error(`[MATCHING] Error sending ${side} trade notification:`, error);

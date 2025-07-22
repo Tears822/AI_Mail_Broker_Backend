@@ -305,10 +305,24 @@ Your Order ID: ${bestBid.id.slice(0, 8)}`;
         data: { status: 'CANCELLED' }
       });
 
-      // WhatsApp notification
-      const user = await prisma.user.findUnique({ where: { id: userId } });
-      if (user && user.phone) {
-        await sendWhatsAppMessage(user.phone, `Your order ${orderId} for ${order.asset} has been cancelled.`);
+      // 📱 WhatsApp notification for order cancellation - enhanced to match web format
+      const cancelUser = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { phone: true, username: true }
+      });
+
+      if (cancelUser?.phone) {
+        const cancelMessage = `❌ ORDER CANCELLED!
+
+${order.asset.toUpperCase()} ${order.action}
+Amount: ${order.remaining}/${order.amount} lots
+Price: $${order.price} per lot
+Order ID: ${order.id.slice(0, 8)}
+
+Your order has been successfully cancelled and removed from the market.`;
+        
+        await sendWhatsAppMessage(cancelUser.phone, cancelMessage);
+        console.log(`📱 Order cancellation notification sent to ${cancelUser.username}`);
       }
 
       // Publish to Redis for real-time updates
@@ -387,12 +401,6 @@ Your Order ID: ${bestBid.id.slice(0, 8)}`;
         data
       });
 
-      // WhatsApp notification
-      const user = await prisma.user.findUnique({ where: { id: userId } });
-      if (user && user.phone) {
-        await sendWhatsAppMessage(user.phone, `Your order ${orderId} for ${updatedOrder.asset} has been updated. New price: ${updatedOrder.price}, amount: ${updatedOrder.amount}.`);
-      }
-
       // Publish to Redis for real-time updates
       await redisUtils.publish('order:updated', {
         orderId: updatedOrder.id,
@@ -441,7 +449,28 @@ Your Order ID: ${bestBid.id.slice(0, 8)}`;
         console.log(`[MATCHING_ENGINE] Triggered matching engine after order update for asset: ${updatedOrder.asset}`);
       }
 
-      return { success: true, message: `Order ${orderId} updated successfully`, order: updatedOrder };
+      // 📱 WhatsApp notification for order update
+      const updateUser = await prisma.user.findUnique({
+        where: { id: updatedOrder.userId },
+        select: { phone: true, username: true }
+      });
+
+      if (updateUser?.phone) {
+        const updateMessage = `📝 ORDER UPDATED!
+
+${updatedOrder.asset.toUpperCase()} ${updatedOrder.action}
+New Amount: ${updatedOrder.amount} lots
+New Price: $${updatedOrder.price} per lot
+New Total Value: $${(Number(updatedOrder.amount) * Number(updatedOrder.price)).toFixed(2)}
+Order ID: ${updatedOrder.id.slice(0, 8)}
+
+Your updated order is now active in the market.`;
+        
+        await sendWhatsAppMessage(updateUser.phone, updateMessage);
+        console.log(`📱 Order update notification sent to ${updateUser.username}`);
+      }
+
+      return { success: true, message: 'Order updated successfully', order: updatedOrder };
     } catch (error) {
       console.error('Error updating order:', error);
       return { success: false, message: 'Failed to update order' };
