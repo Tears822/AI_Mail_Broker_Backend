@@ -32,8 +32,8 @@ export class MatchingEngine {
     additionalQuantity: number;
     timeout: NodeJS.Timeout;
     createdAt: Date;
-    // New fields for two-step approval
-    state?: 'AWAITING_SMALLER' | 'AWAITING_LARGER';
+    // Single step approval - only smaller party gets asked
+    state?: 'AWAITING_SMALLER';
     smallerPartyResponse?: boolean;
   }> = new Map();
 
@@ -265,6 +265,24 @@ export class MatchingEngine {
       
       console.log(`[MATCHING] Price match found for ${asset}: Bid ${bidQuantity} @ ${bestBid.price}, Offer ${offerQuantity} @ ${bestOffer.price}`);
       
+      // Add detailed order information logging
+      console.log(`[MATCHING][DEBUG] ===== ORDER DETAILS =====`);
+      console.log(`[MATCHING][DEBUG] Best Bid Order:`);
+      console.log(`[MATCHING][DEBUG] - ID: ${bestBid.id.slice(0, 8)}`);
+      console.log(`[MATCHING][DEBUG] - User: ${bestBid.userId}`);
+      console.log(`[MATCHING][DEBUG] - Action: ${bestBid.action}`);
+      console.log(`[MATCHING][DEBUG] - Original Amount: ${bestBid.amount}`);
+      console.log(`[MATCHING][DEBUG] - Remaining Amount: ${bestBid.remaining}`);
+      console.log(`[MATCHING][DEBUG] - Price: ${bestBid.price}`);
+      console.log(`[MATCHING][DEBUG] Best Offer Order:`);
+      console.log(`[MATCHING][DEBUG] - ID: ${bestOffer.id.slice(0, 8)}`);
+      console.log(`[MATCHING][DEBUG] - User: ${bestOffer.userId}`);
+      console.log(`[MATCHING][DEBUG] - Action: ${bestOffer.action}`);
+      console.log(`[MATCHING][DEBUG] - Original Amount: ${bestOffer.amount}`);
+      console.log(`[MATCHING][DEBUG] - Remaining Amount: ${bestOffer.remaining}`);
+      console.log(`[MATCHING][DEBUG] - Price: ${bestOffer.price}`);
+      console.log(`[MATCHING][DEBUG] =========================`);
+      
       // Check for quantity mismatch
       if (bidQuantity !== offerQuantity) {
         const smallerQuantity = Math.min(bidQuantity, offerQuantity);
@@ -276,15 +294,32 @@ export class MatchingEngine {
         const smallerOrder = bidQuantity < offerQuantity ? bestBid : bestOffer;
         const largerOrder = bidQuantity < offerQuantity ? bestOffer : bestBid;
 
-        console.log(`[MATCHING][DEBUG] Quantity mismatch analysis:`);
-        console.log(`[MATCHING][DEBUG] - Bid: ${bidQuantity} lots by user ${bestBid.userId} (order: ${bestBid.id.slice(0, 8)})`);
-        console.log(`[MATCHING][DEBUG] - Offer: ${offerQuantity} lots by user ${bestOffer.userId} (order: ${bestOffer.id.slice(0, 8)})`);
-        console.log(`[MATCHING][DEBUG] - bidQuantity < offerQuantity? ${bidQuantity} < ${offerQuantity} = ${bidQuantity < offerQuantity}`);
-        console.log(`[MATCHING][DEBUG] - smallerParty: ${smallerParty}`);
-        console.log(`[MATCHING][DEBUG] - smallerOrder: ${smallerOrder.id.slice(0, 8)} (user: ${smallerOrder.userId})`);
-        console.log(`[MATCHING][DEBUG] - largerOrder: ${largerOrder.id.slice(0, 8)} (user: ${largerOrder.userId})`);
-        console.log(`[MATCHING][DEBUG] - Asking ${smallerParty} (user: ${smallerOrder.userId}) if they want additional ${additionalQuantity} lots`);
-        
+        console.log(`[MATCHING][DEBUG] ===== QUANTITY MISMATCH ANALYSIS =====`);
+        console.log(`[MATCHING][DEBUG] Asset: ${asset}`);
+        console.log(`[MATCHING][DEBUG] Bid: ${bidQuantity} lots by user ${bestBid.userId} (order: ${bestBid.id.slice(0, 8)})`);
+        console.log(`[MATCHING][DEBUG] Offer: ${offerQuantity} lots by user ${bestOffer.userId} (order: ${bestOffer.id.slice(0, 8)})`);
+        console.log(`[MATCHING][DEBUG] Comparison: ${bidQuantity} < ${offerQuantity} = ${bidQuantity < offerQuantity}`);
+        console.log(`[MATCHING][DEBUG] Smaller party: ${smallerParty}`);
+        console.log(`[MATCHING][DEBUG] Smaller order: ${smallerOrder.id.slice(0, 8)} (user: ${smallerOrder.userId})`);
+        console.log(`[MATCHING][DEBUG] Larger order: ${largerOrder.id.slice(0, 8)} (user: ${largerOrder.userId})`);
+        console.log(`[MATCHING][DEBUG] Additional quantity needed: ${additionalQuantity} lots`);
+        console.log(`[MATCHING][DEBUG] NOTIFICATION TARGET: User ${smallerOrder.userId} (${smallerParty})`);
+        console.log(`[MATCHING][DEBUG] ===============================================`);
+
+        // Add validation check
+        console.log(`[MATCHING][DEBUG] ===== VALIDATION CHECK =====`);
+        console.log(`[MATCHING][DEBUG] Expected behavior:`);
+        if (smallerParty === 'SELLER') {
+          console.log(`[MATCHING][DEBUG] ✅ SELLER (${smallerQuantity} lots) should be asked to increase to ${largerQuantity} lots`);
+          console.log(`[MATCHING][DEBUG] ✅ SELLER user ${smallerOrder.userId} should receive confirmation`);
+          console.log(`[MATCHING][DEBUG] ✅ BUYER user ${largerOrder.userId} should NOT receive confirmation`);
+        } else {
+          console.log(`[MATCHING][DEBUG] ✅ BUYER (${smallerQuantity} lots) should be asked to increase to ${largerQuantity} lots`);
+          console.log(`[MATCHING][DEBUG] ✅ BUYER user ${smallerOrder.userId} should receive confirmation`);
+          console.log(`[MATCHING][DEBUG] ✅ SELLER user ${largerOrder.userId} should NOT receive confirmation`);
+        }
+        console.log(`[MATCHING][DEBUG] ===============================`);
+
         console.log(`[MATCHING] Quantity mismatch detected: ${smallerParty} has ${smallerQuantity}, other party has ${largerQuantity}. Asking ${smallerParty} if they want additional ${additionalQuantity} lots.`);
         
         // Create a pending quantity confirmation
@@ -324,7 +359,7 @@ export class MatchingEngine {
         });
         
         // Send confirmation request to the smaller party
-        this.wsService.notifyUser(smallerOrder.userId, 'quantity:confirmation_request', {
+        const wsNotificationData = {
           confirmationKey,
           asset,
           yourOrderId: smallerOrder.id,
@@ -335,7 +370,18 @@ export class MatchingEngine {
           price: bestBid.price, // Trade price
           side: smallerParty === 'BUYER' ? 'BUY' : 'SELL',
           message: `Do you want to ${smallerParty === 'BUYER' ? 'buy' : 'sell'} ${additionalQuantity} additional lots at $${bestBid.price}? (Total would be ${largerQuantity} lots instead of ${smallerQuantity} lots)`
+        };
+        
+        console.log(`[MATCHING][DEBUG] Sending WebSocket notification to user ${smallerOrder.userId}:`, {
+          event: 'quantity:confirmation_request',
+          targetUserId: smallerOrder.userId,
+          yourOrderId: smallerOrder.id.slice(0, 8),
+          yourQuantity: smallerQuantity,
+          additionalQuantity,
+          side: wsNotificationData.side
         });
+        
+        this.wsService.notifyUser(smallerOrder.userId, 'quantity:confirmation_request', wsNotificationData);
         
         // 📱 WhatsApp notification for quantity confirmation
         const whatsappMessage = `🤝 QUANTITY CONFIRMATION NEEDED
@@ -350,6 +396,7 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
 
 ⏰ You have 60 seconds to respond.`;
         
+        console.log(`[MATCHING][DEBUG] Sending WhatsApp notification to user ${smallerOrder.userId}`);
         await this.notifyUserViaWhatsApp(smallerOrder.userId, whatsappMessage);
         
         return; // Wait for confirmation before proceeding
@@ -523,71 +570,38 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
           console.log(`[MATCHING][DEBUG] Smaller party accepted. Executing match for increased quantity.`);
           return;
         } else {
-          // User declined or timeout, now ask the larger party
-          confirmation.state = 'AWAITING_LARGER';
-          // Set new timeout for larger party
-          confirmation.timeout = setTimeout(() => {
-            this.handleQuantityConfirmationResponse(confirmationKey, false);
-          }, 60000);
-          // Notify larger party
-          const largerParty = confirmation.smallerParty === 'BUYER' ? 'SELLER' : 'BUYER';
-          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
+          // User declined - NO TRADE EXECUTED, no second step
+          console.log(`[MATCHING][DEBUG] Smaller party declined to increase quantity. No trade executed.`);
+          
+          // Notify both parties that no trade was executed
           const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
+          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
           
-          // First, notify the larger party that the smaller party declined
-          this.wsService.notifyUser(largerOrder.userId, 'quantity:counterparty_declined', {
-            message: `The counterparty declined to increase their order. They want to trade only ${confirmation.smallerQuantity} lots.`,
-            asset: confirmation.asset,
-            counterpartyQuantity: confirmation.smallerQuantity,
-            yourQuantity: confirmation.largerQuantity
+          // Notify smaller party (the one who declined)
+          this.wsService.notifyUser(smallerOrder.userId, 'quantity:partial_fill_declined', {
+            message: 'You declined to increase your order quantity. No trade was executed.'
           });
           
-          // Send WhatsApp notification about the decline
-          const declineMessage = `❌ COUNTERPARTY DECLINED\n\n${confirmation.asset.toUpperCase()} @ $${confirmation.bidOrder.price}\n\nThe ${confirmation.smallerParty === 'BUYER' ? 'buyer' : 'seller'} declined to increase their order from ${confirmation.smallerQuantity} to ${confirmation.largerQuantity} lots.\n\nThey only want to trade ${confirmation.smallerQuantity} lots.`;
-          await this.notifyUserViaWhatsApp(largerOrder.userId, declineMessage);
-          
-          // Then ask the larger party if they want to proceed with partial fill
-          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_approval', {
-            confirmationKey,
-            asset: confirmation.asset,
-            yourOrderId: largerOrder.id,
-            counterpartyOrderId: confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder.id : confirmation.offerOrder.id,
-            yourQuantity: confirmation.largerQuantity,
-            partialFillQuantity: confirmation.smallerQuantity,
-            price: confirmation.bidOrder.price,
-            side: largerParty === 'BUYER' ? 'BUY' : 'SELL',
-            message: `Do you want to ${largerParty === 'BUYER' ? 'buy' : 'sell'} only ${confirmation.smallerQuantity} lots at $${confirmation.bidOrder.price}? (Your order is for ${confirmation.largerQuantity} lots)`
+          // Notify larger party (the one who was waiting)
+          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_declined', {
+            message: 'The counterparty declined to increase their order quantity. No trade was executed.'
           });
-          const whatsappMessage = `⚠️ PARTIAL FILL APPROVAL NEEDED\n\n${confirmation.asset.toUpperCase()} @ $${confirmation.bidOrder.price}\nYour order: ${confirmation.largerQuantity} lots\nCounterparty: ${confirmation.smallerQuantity} lots\n\nDo you want to proceed with a partial fill for ${confirmation.smallerQuantity} lots?\nReply "YES ${largerOrder.id.slice(0, 8)}" to accept\nReply "NO ${largerOrder.id.slice(0, 8)}" to keep your order active.\n\n⏰ You have 60 seconds to respond.`;
-          await this.notifyUserViaWhatsApp(largerOrder.userId, whatsappMessage);
-          console.log(`[MATCHING][DEBUG] Smaller party declined. Notified larger party (${largerOrder.userId}) about decline and asked for partial fill approval.`);
-          // Do not delete confirmation yet
+          
+          // WhatsApp notifications
+          await this.notifyUserViaWhatsApp(smallerOrder.userId, '❌ QUANTITY INCREASE DECLINED\n\nYou declined to increase your order quantity. No trade was executed. Your order remains active for the original amount.');
+          await this.notifyUserViaWhatsApp(largerOrder.userId, '❌ COUNTERPARTY DECLINED\n\nThe counterparty declined to increase their order quantity. No trade was executed. Your order remains active for the full amount.');
+          
+          // Mark this pair as declined so it won't be retried
+          this.declinedPartialFills.add(confirmationKey);
+          this.pendingConfirmations.delete(confirmationKey);
+          console.log(`[MATCHING][DEBUG] Smaller party declined. No trade executed. Confirmation deleted. Marked as declined for this pair.`);
           return;
         }
       }
-      // Step 2: Awaiting larger party
+      // Legacy support for old state (should not happen with new logic)
       if (confirmation.state === 'AWAITING_LARGER') {
+        console.log(`[MATCHING][DEBUG] Legacy AWAITING_LARGER state detected - this should not happen with new logic`);
         this.pendingConfirmations.delete(confirmationKey);
-        if (accepted) {
-          console.log(`[MATCHING][DEBUG] Larger party accepted partial fill. Executing match for smaller quantity.`);
-          await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
-        } else {
-          // Larger party declined, do not execute trade
-          // Notify both parties
-          const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
-          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
-          this.wsService.notifyUser(smallerOrder.userId, 'quantity:partial_fill_declined', {
-            message: 'Partial fill was declined by the counterparty. No trade was executed.'
-          });
-          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_declined', {
-            message: 'You declined the partial fill. No trade was executed.'
-          });
-          await this.notifyUserViaWhatsApp(smallerOrder.userId, '❌ PARTIAL FILL DECLINED\n\nThe counterparty declined the partial fill. No trade was executed. Your order remains active.');
-          await this.notifyUserViaWhatsApp(largerOrder.userId, '❌ PARTIAL FILL DECLINED\n\nYou declined the partial fill. No trade was executed. Your order remains active for the full amount.');
-          // Robust: Mark this pair as declined so it won't be retried
-          this.declinedPartialFills.add(confirmationKey);
-          console.log(`[MATCHING][DEBUG] Larger party declined partial fill. No trade executed. Confirmation deleted. Marked as declined for this pair.`);
-        }
         return;
       }
     } catch (error) {

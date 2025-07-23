@@ -534,44 +534,38 @@ Status: ${order.status}`;
         }
         // Step 1: Smaller party approval
         if (confirmation.state === 'AWAITING_SMALLER' && isSmallerParty) {
-          let newQuantity: number | undefined;
-          if (accepted) {
+        let newQuantity: number | undefined;
+        if (accepted) {
             newQuantity = confirmation.largerQuantity;
-          }
-          await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted, newQuantity);
-          if (accepted) {
-            return {
-              success: true,
+        }
+        await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted, newQuantity);
+        if (accepted) {
+          return {
+            success: true,
               response: `✅ Confirmation ACCEPTED!\n\nYou've agreed to trade ${confirmation.largerQuantity} lots of ${confirmation.asset} instead of ${confirmation.smallerQuantity} lots.\n\nYour order is being updated and the trade will execute automatically.`
-            };
-          } else {
-            return {
-              success: true,
+          };
+        } else {
+          return {
+            success: true,
               response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. The counterparty will now be asked to approve a partial fill for ${confirmation.smallerQuantity} lots.`
             };
           }
         }
-        // Step 2: Larger party approval
+        // Legacy support for old state (should not happen with new logic)
         if (confirmation.state === 'AWAITING_LARGER' && isLargerParty) {
-          await matchingEngine.handleQuantityConfirmationResponse(confirmationKey, accepted);
-          if (accepted) {
-            return {
-              success: true,
-              response: `✅ Partial Fill APPROVED!\n\nYou've agreed to a partial fill for ${confirmation.smallerQuantity} lots of ${confirmation.asset}. The trade will execute now.`
-            };
-          } else {
-            return {
-              success: true,
-              response: `❌ Partial Fill DECLINED.\n\nYou declined the partial fill. No trade was executed. Your order remains active for the full amount.`
-            };
-          }
+          console.log(`[NLP][DEBUG] Legacy AWAITING_LARGER state detected - this should not happen with new logic`);
+          return {
+            success: false,
+            response: '',
+            error: 'This confirmation request is in an invalid state. Please contact support.'
+          };
         }
         // If user is not authorized to respond
         return {
           success: false,
           response: '',
           error: 'This confirmation request was not sent to you or is not in the correct state.'
-        };
+          };
       }
     }
 

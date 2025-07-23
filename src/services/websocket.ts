@@ -444,6 +444,19 @@ export class WebSocketService {
 
   // Direct user notifications
   public notifyUser(userId: string, event: string, data: any) {
+    console.log(`[WEBSOCKET][DEBUG] Sending notification to user ${userId}:`, {
+      event,
+      targetUserId: userId,
+      dataPreview: {
+        asset: data.asset,
+        yourOrderId: data.yourOrderId?.slice(0, 8),
+        yourQuantity: data.yourQuantity,
+        additionalQuantity: data.additionalQuantity,
+        side: data.side,
+        message: data.message?.substring(0, 100) + '...'
+      }
+    });
+    
     this.io.to(`user:${userId}`).emit(event, {
       type: event,
       data,
