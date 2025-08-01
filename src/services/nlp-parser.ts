@@ -377,8 +377,9 @@ ${!session.isRegistered ? '\n💡 You are using a guest account. Register at our
       };
     }
 
-    // Handle market data request
-    if (cleanMessage.includes('market') || cleanMessage.includes('price')) {
+    // Handle market data request - More specific to avoid conflicts with edit commands
+    if ((cleanMessage.includes('market') || cleanMessage === 'price') && 
+        !cleanMessage.includes('edit') && !cleanMessage.includes('update') && !cleanMessage.includes('modify')) {
       const marketData = await orderBookService.getMarketData();
       if (marketData.length === 0) {
         return {
@@ -547,7 +548,7 @@ Status: ${order.status}`;
         } else {
           return {
             success: true,
-              response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. The counterparty will now be asked to approve a partial fill for ${confirmation.smallerQuantity} lots.`
+              response: `✅ Confirmation received: NO\n\nYou've chosen to proceed with your original ${confirmation.smallerQuantity} lots order. A partial trade for ${confirmation.smallerQuantity} lots will be executed automatically.`
             };
           }
         }
@@ -602,6 +603,7 @@ Status: ${order.status}`;
 
     // Handle order editing - Enhanced with "last order" support
     if (cleanMessage.includes('edit') || cleanMessage.includes('update') || cleanMessage.includes('modify')) {
+      console.log(`[NLP] Processing edit command: "${cleanMessage}"`);
       let orderId = '';
       
       // Check if user wants to edit their last order
@@ -625,8 +627,10 @@ Status: ${order.status}`;
           };
         }
       } else {
-        // Standard order ID matching
+        // Standard order ID matching - support both full UUIDs and partial IDs (8+ characters)
         const orderIdMatch = cleanMessage.match(/(?:edit|update|modify)(?:\s+order)?\s+([a-f0-9-]{8,})/i);
+        console.log(`[NLP] Order ID regex match result:`, orderIdMatch);
+        
         if (!orderIdMatch) {
           return {
             success: false,
@@ -635,11 +639,39 @@ Status: ${order.status}`;
           };
         }
         orderId = orderIdMatch[1];
+        console.log(`[NLP] Extracted order ID: ${orderId} (length: ${orderId.length})`);
+        
+        // If the order ID is less than 36 characters (full UUID), we need to find the full order ID
+        if (orderId.length < 36) {
+          try {
+            const orders = await orderBookService.getUserOrders(session.userId);
+            console.log(`[NLP] Searching through ${orders.length} orders for ID starting with: ${orderId}`);
+            const matchingOrder = orders.find(order => order.id.startsWith(orderId));
+            if (!matchingOrder) {
+              return {
+                success: false,
+                response: '',
+                error: `Order ID ${orderId} not found in your active orders. Use "Orders" to see your current orders.`
+              };
+            }
+            orderId = matchingOrder.id; // Use the full order ID
+            console.log(`[NLP] Found full order ID: ${orderId} for partial ID: ${orderIdMatch[1]}`);
+          } catch (error) {
+            return {
+              success: false,
+              response: '',
+              error: 'Failed to retrieve your orders.'
+            };
+          }
+        }
       }
       
       // Extract price and/or amount updates
       const priceMatch = cleanMessage.match(/price\s+(\d+(?:\.\d+)?)/i);
       const amountMatch = cleanMessage.match(/(?:amount|quantity|qty)\s+(\d+)/i);
+      
+      console.log(`[NLP] Price match:`, priceMatch);
+      console.log(`[NLP] Amount match:`, amountMatch);
       
       if (!priceMatch && !amountMatch) {
         return {

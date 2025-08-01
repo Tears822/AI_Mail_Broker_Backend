@@ -22,9 +22,8 @@ export class WebSocketService {
   constructor(server: HTTPServer) {
     const allowedOrigins = [
       process.env.FRONTEND_URL || "http://localhost:3000",
-      "https://giftcard.88808880.xyz",
-      "https://api.giftcard.88808880.xyz", 
-      "https://webhook.88808880.xyz",
+      "https://mailbroker.ddns.net",
+      "https://apimailbroker.ddns.net", 
       "http://localhost:3000",
       "http://localhost:3001"
     ];

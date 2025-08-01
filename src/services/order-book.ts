@@ -111,21 +111,21 @@ export class OrderBookService {
       if (user?.phone) {
         const orderMessage = `✅ ORDER CREATED!
 
-${order.asset.toUpperCase()} ${order.action}
-Amount: ${order.amount} lots
-Price: $${order.price} per lot
-Total Value: $${(Number(order.amount) * Number(order.price)).toFixed(2)}
-Order ID: ${order.id.slice(0, 8)}
+      ${order.asset.toUpperCase()} ${order.action}
+      Amount: ${order.amount} lots
+      Price: $${order.price} per lot
+      Total Value: $${(Number(order.amount) * Number(order.price)).toFixed(2)}
+      Order ID: ${order.id.slice(0, 8)}
 
-Your order is now active in the market.`;
+      Your order is now active in the market.`;
         
         await sendWhatsAppMessage(user.phone, orderMessage);
         console.log(`📱 Order creation notification sent to ${user.username}`);
       }
 
       // Send market status update to other users
-      const marketStatusMessage = `New ${order.action.toLowerCase()} order: ${order.amount} lots @ $${order.price}`;
-      await this.broadcastMarketStatusToWhatsApp(order.asset, marketStatusMessage, order.userId);
+      // const marketStatusMessage = `New ${order.action.toLowerCase()} order: ${order.amount} lots @ $${order.price}`;
+      // await this.broadcastMarketStatusToWhatsApp(order.asset, marketStatusMessage, order.userId);
 
       // Subscribe user to market room for this asset
       if (this.wsService) {
@@ -215,15 +215,17 @@ Use: "Edit ${newOrder.id.slice(0, 8)} price ${offerPrice}" to match the offer.`;
         await this.sendWhatsAppToUser(newOrder.userId, message);
 
         // Also notify the offer holder about the new competing bid
-        const offerHolderMessage = `💰 NEW COMPETITIVE BID!
+        const offerHolderMessage = `💰 COMPETITIVE OPPORTUNITY!
 
-${asset.toUpperCase()}
-Your OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
-NEW BID: ${newOrder.remaining} lots @ $${newOrder.price}
-Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
+        ${asset.toUpperCase()}
+        Your OFFER: ${bestOffer.remaining} lots @ $${offerPrice}
+        Available NEW BID: ${newOrder.remaining} lots @ $${newOrder.price}
+        Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
 
-💡 Consider lowering your offer to $${newOrder.price} to trade immediately!
-Your Order ID: ${bestOffer.id.slice(0, 8)}`;
+        💡 You could trade immediately by lowering your offer to $${newOrder.price}!
+        Your Order ID: ${bestOffer.id.slice(0, 8)}
+
+        Use: "Edit ${bestOffer.id.slice(0, 8)} price ${newOrder.price}" to match the bid.`;
 
         await this.sendWhatsAppToUser(bestOffer.userId, offerHolderMessage);
       }
@@ -245,15 +247,17 @@ Use: "Edit ${newOrder.id.slice(0, 8)} price ${bidPrice}" to match the bid.`;
         await this.sendWhatsAppToUser(newOrder.userId, message);
 
         // Also notify the bid holder about the new competing offer
-        const bidHolderMessage = `💰 NEW COMPETITIVE OFFER!
+        const bidHolderMessage = `💰 COMPETITIVE OPPORTUNITY!
 
 ${asset.toUpperCase()}
 Your BID: ${bestBid.remaining} lots @ $${bidPrice}
-NEW OFFER: ${newOrder.remaining} lots @ $${newOrder.price}
+Available NEW OFFER: ${newOrder.remaining} lots @ $${newOrder.price}
 Spread: $${spread.toFixed(2)} (${spreadPercentage.toFixed(1)}%)
 
-💡 Consider improving your bid to $${newOrder.price} to trade immediately!
-Your Order ID: ${bestBid.id.slice(0, 8)}`;
+💡 You could trade immediately by improving your bid to $${newOrder.price}!
+Your Order ID: ${bestBid.id.slice(0, 8)}
+
+Use: "Edit ${bestBid.id.slice(0, 8)} price ${newOrder.price}" to match the offer.`;
 
         await this.sendWhatsAppToUser(bestBid.userId, bidHolderMessage);
       }

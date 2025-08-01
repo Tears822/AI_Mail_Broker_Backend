@@ -410,38 +410,51 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
     // 🔥 NEW: Send competitive bidding alerts when prices don't match but are close
     if (Number(bestBid.price) < Number(bestOffer.price)) {
       // Prices don't match - send competitive bidding alerts
-      await this.sendCompetitiveBiddingAlerts(asset, bestBid, bestOffer);
-    }
+      // await this.sendCompetitiveBiddingAlerts(asset, bestBid, bestOffer);
+      console.log(`[MATCHING] Skipping competitive alerts - already sent by order book service`);
+      
+      // Only start negotiation if prices are close enough (within 5% spread)
+      const spread = Number(bestOffer.price) - Number(bestBid.price);
+      const spreadPercentage = (spread / Number(bestBid.price)) * 100;
+      
+      if (spreadPercentage <= 5) { // Only negotiate if spread is 5% or less
+        // If no negotiation state, start one
+        if (!this.negotiationState.has(asset)) {
+          this.negotiationState.set(asset, {
+            bestBid,
+            bestOffer,
+            turn: 'OFFER', // Offer responds to new best bid
+            timeout: null
+          });
+          this.notifyNegotiation(asset);
+          return;
+        }
 
-    // If no negotiation state, start one
-    if (!this.negotiationState.has(asset)) {
-      this.negotiationState.set(asset, {
-        bestBid,
-        bestOffer,
-        turn: 'OFFER', // Offer responds to new best bid
-        timeout: null
-      });
-      this.notifyNegotiation(asset);
-      return;
-    }
-
-    // If best bid/offer changed, update negotiation state and notify
-    const state = this.negotiationState.get(asset)!;
-    let updated = false;
-    if (bestBid.id !== state.bestBid.id) {
-      state.bestBid = bestBid;
-      state.turn = 'OFFER';
-      updated = true;
-    }
-    if (bestOffer.id !== state.bestOffer.id) {
-      state.bestOffer = bestOffer;
-      state.turn = 'BID';
-      updated = true;
-    }
-    if (updated) {
-      if (state.timeout) clearTimeout(state.timeout);
-      this.notifyNegotiation(asset);
-      return;
+        // If best bid/offer changed, update negotiation state and notify
+        const state = this.negotiationState.get(asset)!;
+        let updated = false;
+        if (bestBid.id !== state.bestBid.id) {
+          state.bestBid = bestBid;
+          state.turn = 'OFFER';
+          updated = true;
+        }
+        if (bestOffer.id !== state.bestOffer.id) {
+          state.bestOffer = bestOffer;
+          state.turn = 'BID';
+          updated = true;
+        }
+        if (updated) {
+          if (state.timeout) clearTimeout(state.timeout);
+          this.notifyNegotiation(asset);
+          return;
+        }
+      } else {
+        // Clear any existing negotiation state if spread is too wide
+        if (this.negotiationState.has(asset)) {
+          console.log(`[MATCHING] Clearing negotiation state for ${asset} - spread too wide (${spreadPercentage.toFixed(1)}%)`);
+          this.negotiationState.delete(asset);
+        }
+      }
     }
   }
 
@@ -550,6 +563,15 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
     }
     try {
       clearTimeout(confirmation.timeout);
+      
+      // 🔥 NEW: Send WebSocket notification to close the popup for the user who was asked for confirmation
+      const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
+      this.wsService.notifyUser(smallerOrder.userId, 'quantity:confirmation_closed', {
+        confirmationKey,
+        response: accepted ? 'accepted' : 'declined',
+        message: accepted ? 'Quantity confirmation accepted' : 'Quantity confirmation declined'
+      });
+      
       // Step 1: Awaiting smaller party
       if (confirmation.state === 'AWAITING_SMALLER') {
         confirmation.smallerPartyResponse = accepted;
@@ -570,31 +592,14 @@ Reply "NO ${smallerOrder.id.slice(0, 8)}" to proceed with ${smallerQuantity} lot
           console.log(`[MATCHING][DEBUG] Smaller party accepted. Executing match for increased quantity.`);
           return;
         } else {
-          // User declined - NO TRADE EXECUTED, no second step
-          console.log(`[MATCHING][DEBUG] Smaller party declined to increase quantity. No trade executed.`);
+          // User declined - EXECUTE PARTIAL TRADE with original smaller quantity
+          console.log(`[MATCHING][DEBUG] Smaller party declined to increase quantity. Executing partial trade for ${confirmation.smallerQuantity} lots.`);
           
-          // Notify both parties that no trade was executed
-          const smallerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.bidOrder : confirmation.offerOrder;
-          const largerOrder = confirmation.smallerParty === 'BUYER' ? confirmation.offerOrder : confirmation.bidOrder;
-          
-          // Notify smaller party (the one who declined)
-          this.wsService.notifyUser(smallerOrder.userId, 'quantity:partial_fill_declined', {
-            message: 'You declined to increase your order quantity. No trade was executed.'
-          });
-          
-          // Notify larger party (the one who was waiting)
-          this.wsService.notifyUser(largerOrder.userId, 'quantity:partial_fill_declined', {
-            message: 'The counterparty declined to increase their order quantity. No trade was executed.'
-          });
-          
-          // WhatsApp notifications
-          await this.notifyUserViaWhatsApp(smallerOrder.userId, '❌ QUANTITY INCREASE DECLINED\n\nYou declined to increase your order quantity. No trade was executed. Your order remains active for the original amount.');
-          await this.notifyUserViaWhatsApp(largerOrder.userId, '❌ COUNTERPARTY DECLINED\n\nThe counterparty declined to increase their order quantity. No trade was executed. Your order remains active for the full amount.');
-          
-          // Mark this pair as declined so it won't be retried
-          this.declinedPartialFills.add(confirmationKey);
+          // Execute partial trade with the original orders - let executeMatch handle the reduction
           this.pendingConfirmations.delete(confirmationKey);
-          console.log(`[MATCHING][DEBUG] Smaller party declined. No trade executed. Confirmation deleted. Marked as declined for this pair.`);
+          await this.executeMatch(confirmation.bidOrder, confirmation.offerOrder);
+          
+          console.log(`[MATCHING][DEBUG] Partial trade executed for ${confirmation.smallerQuantity} lots. Larger party order remains active.`);
           return;
         }
       }

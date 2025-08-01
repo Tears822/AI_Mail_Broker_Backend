@@ -28,9 +28,8 @@ const corsOrigins = process.env.CORS_ORIGINS
   : [
       'http://localhost:3000', 
       'http://localhost:3001',
-      'https://giftcard.88808880.xyz',
-      'https://api.giftcard.88808880.xyz',
-      'https://webhook.88808880.xyz'
+      'https://mailbroker.ddns.net',
+      'https://apimailbroker.ddns.net',
     ];
 
 app.use(cors({
